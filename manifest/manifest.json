@@ -1,0 +1,56 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.30/MicrosoftTeams.schema.json",
+  "version": "1.0.0",
+  "manifestVersion": "1.30",
+  "id": "<agent-identity>",
+  "developer": {
+    "name": "Joe Tan",
+    "websiteUrl": "https://joetanx.github.io",
+    "privacyUrl": "https://www.microsoft.com/en-us/privacy/privacystatement",
+    "termsOfUseUrl": "https://www.microsoft.com/en-us/legal/terms-of-use"
+  },
+  "name": {
+    "short": "SOC Buddy",
+    "full": "SOC Buddy"
+  },
+  "description": {
+    "short": "Security operations assistant built on LangChain.",
+    "full": "Security operations assistant built on LangChain; equipped with Sentinel MCP data exploration and triage tool, as well as Work IQ mail tool to send email."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#4285F4",
+  "validDomains": [
+    "*.botframework.com",
+    "*.azurecontainerapps.io"
+  ],
+  "webApplicationInfo": {
+    "id": "<agent-identity>"
+  },
+  "bots": [
+    {
+      "botId": "<teams-bot-id>",
+      "scopes": [
+        "personal",
+        "team",
+        "groupChat",
+        "copilot"
+      ],
+      "isNotificationOnly": false,
+      "supportsCalling": false,
+      "supportsVideo": false,
+      "supportsFiles": false
+    }
+  ],
+  "supportsChannelFeatures": "tier1",
+  "copilotAgents": {
+    "customEngineAgents": [
+      {
+        "id": "<teams-bot-id>",
+        "type": "bot"
+      }
+    ]
+  }
+}

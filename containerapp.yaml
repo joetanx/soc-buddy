@@ -1,0 +1,82 @@
+location: ${LOCATION}
+resourceGroup: ${RG}
+name: ${APP_NAME}
+identity:
+  type: UserAssigned
+  userAssignedIdentities:
+    ${UAMI_RSC_ID}: {}
+properties:
+  managedEnvironmentId: ${CAE_ID}
+  configuration:
+    registries:
+      - server: ${ACR_NAME}.azurecr.io
+        identity: ${UAMI_RSC_ID}
+    ingress:
+      external: true
+      allowInsecure: false
+      targetPort: 3978
+      transport: auto
+  template:
+    containers:
+      - name: ${APP_NAME}
+        image: ${ACR_NAME}.azurecr.io/${APP_NAME}:latest
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+        env:
+          # Listener for aiohttp.web run_app
+          - name: HOST
+            value: "0.0.0.0"
+          - name: PORT
+            value: "3978"
+          # LangChain model connection
+          - name: FOUNDRY_PROJECT_ENDPOINT
+            value: "${FOUNDRY_PROJECT_ENDPOINT}"
+          - name: FOUNDRY_MODEL
+            value: "${FOUNDRY_MODEL}"
+          - name: UAMI_CLIENT_ID
+            value: "${UAMI_CLIENT_ID}"
+          # Human-user authorization code flow
+          - name: OAUTH_REDIRECT_URI
+            value: "${OAUTH_REDIRECT_URI}"
+          - name: AUTH_FLOW_TTL_SECONDS
+            value: "600"
+          # Teams bot connection settings
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHORITY
+            value: "https://login.microsoftonline.com/${TENANT_ID}"
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHTYPE
+            value: FederatedCredentials
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID
+            value: "${TEAMS_BOT_CLIENT_ID}"
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__FEDERATEDCLIENTID
+            value: "${UAMI_CLIENT_ID}"
+          - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID
+            value: "${TENANT_ID}"
+          # Agent identity connection settings
+          - name: CONNECTIONS__AGENTIC__SETTINGS__AUTHORITY
+            value: "https://login.microsoftonline.com/${TENANT_ID}"
+          - name: CONNECTIONS__AGENTIC__SETTINGS__AUTHTYPE
+            value: FederatedCredentials
+          - name: CONNECTIONS__AGENTIC__SETTINGS__CLIENTID
+            value: "${BLUEPRINT_CLIENT_ID}"
+          - name: CONNECTIONS__AGENTIC__SETTINGS__FEDERATEDCLIENTID
+            value: "${UAMI_CLIENT_ID}"
+          - name: CONNECTIONS__AGENTIC__SETTINGS__TENANTID
+            value: "${TENANT_ID}"
+          - name: AGENTIC_INSTANCE_ID
+            value: "${AGENTIC_INSTANCE_ID}"
+          # Connections map
+          # SERVICEURL accepts case-insensitive regex, mapping Teams traffic sources to SERVICE_CONNECTION (Teams bot)
+          - name: CONNECTIONSMAP__0__SERVICEURL
+            value: "^https://(?:api.botframework.com|smba.trafficmanager.net)(?:/.*)?$"
+          - name: CONNECTIONSMAP__0__CONNECTION
+            value: "SERVICE_CONNECTION"
+          - name: CONNECTIONSMAP__1__SERVICEURL
+            value: "*"
+          - name: CONNECTIONSMAP__1__CONNECTION
+            value: "AGENTIC"
+          - name: CONNECTIONSMAP__1__AUDIENCE
+            value: "${BLUEPRINT_CLIENT_ID}"
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
