@@ -60,7 +60,6 @@ agent_app = AgentApplication[TurnState](
 )
 
 tenant_id = agents_sdk_config['CONNECTIONS']['SERVICE_CONNECTION']['SETTINGS']['TENANTID']
-agent_blueprint_id = agents_sdk_config['CONNECTIONS']['AGENTIC']['SETTINGS']['CLIENTID']
 
 # Initialize global MSAL token cache.
 msal_token_cache = msal.SerializableTokenCache()
@@ -414,12 +413,17 @@ def main() -> None:
 
     @agent_app.activity("message")
     async def on_message(context: TurnContext, _: TurnState) -> None:
-        # Set up the baggage context for the current request.
+        # Set BaggageBuilder with some manual attribute mappings because the specific attributes that `populate` uses from TurnContext does not map correctly.
         user_id = getattr(context.activity.from_property, "aad_object_id", None)
-        user_name = getattr(context.activity.from_property, "name", None)
-        builder = BaggageBuilder()
+        builder = (
+            BaggageBuilder()
+            .tenant_id(tenant_id)
+            .agent_blueprint_id(agents_sdk_config["CONNECTIONS"]["AGENTIC"]["SETTINGS"]["CLIENTID"])
+            .agent_id(agent_id)
+            .agentic_user_id(user_id)
+        )
         populate(builder, context)
-        with builder.tenant_id(tenant_id).agent_blueprint_id(agent_blueprint_id).agent_id(agent_id).user_id(user_id).user_name(user_name).build():
+        with builder.build():
             text = (context.activity.text or "").strip()
             if not text:
                 return
