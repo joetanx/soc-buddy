@@ -89,13 +89,6 @@ async def get_observability_token() -> str:
         scopes=["api://9b975845-388f-4429-889e-eab1ef63949c/.default"]
     )["access_token"]
 
-async def get_obo_token(user_assertion: str, scopes: list[str]) -> str:
-    # Get agent ID on-behalf-of (OBO) token for specified scopes with user assertion.
-    return (await get_agent_id_msal_app()).acquire_token_on_behalf_of(
-        user_assertion=user_assertion,
-        scopes=scopes
-    )["access_token"]
-
 
 # Token acquisition methods for Teams bot.
 teams_bot_id = agents_sdk_config['CONNECTIONS']['SERVICE_CONNECTION']['SETTINGS']['CLIENTID']

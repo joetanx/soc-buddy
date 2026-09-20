@@ -104,13 +104,13 @@ The setup is designed to be run in Azure Cloud Shell (bash), which has `az`, `do
 
 Deploying SOC Buddy interacts with Azure Subscription resources and Microsoft Entra ID. Ensure the deploying user (or automated service principal) possesses the following roles:
 
-| Type | Least privilege role | Scope | Usage |
-|---|---|---|---|
-| Azure RBAC | Contributor | Subscription | Create Azure resources. |
-| Azure RBAC | User Access Administrator | Subscription | Assign `Cognitive Services User` and `AcrPull` roles to the User-Assigned Managed Identity (UAMI). |
-| Entra ID | Cloud Application Administrator / Application Administrator | User | Create service principal; Add Federated Identity Credentials (FIC) to the Agent Blueprint and Teams Bot app registrations. |
-| Entra ID | Privileged Role Administrator | User | Grant tenant-wide Admin Consent for delegated scopes on the Blueprint (`SecurityIncident.ReadWrite.All`, Sentinel MCP scopes). |
-| Entra ID | AI Administrator | User | Publish agent manifest in Microsoft 365 Admin Center. |
+| Least privilege role | Type / Scope | Usage |
+|---|---|---|
+| Contributor | Azure RBAC / Subscription | Create Azure resources. |
+| User Access Administrator | Azure RBAC / Subscription | Assign `Cognitive Services User` and `AcrPull` roles to the User-Assigned Managed Identity (UAMI). |
+| Cloud Application Administrator / Application Administrator | Entra ID / User | Create service principal; Add Federated Identity Credentials (FIC) to the Agent Blueprint and Teams Bot app registrations. |
+| Privileged Role Administrator | Entra ID / User | Grant tenant-wide Admin Consent for delegated scopes on the Blueprint (`SecurityIncident.ReadWrite.All`, Sentinel MCP scopes). |
+| AI Administrator | Entra ID / User | Publish agent manifest in Microsoft 365 Admin Center. |
 
 ### 1.2. Provision Agent Identity  with a365 CLI
 
@@ -118,24 +118,40 @@ The a365 CLI requires several human interaction when provisioning agent identity
 
 1. Install a365 CLI in the Cloud Shell:
 
-```sh
-dotnet tool install --global Microsoft.Agents.A365.DevTools.Cli
-export PATH=$PATH:/home/system/.dotnet/tools/
-```
+    ```sh
+    dotnet tool install --global Microsoft.Agents.A365.DevTools.Cli
+    export PATH=$PATH:/home/system/.dotnet/tools/
+    ```
 
 2. Verify Client App Requirements:
 
-```sh
-a365 setup requirements
-```
+    ```sh
+    a365 setup requirements
+    ```
 
-3. Provision the Agent:
+3. Add Work IQ Mail MCP server
 
-```sh
-a365 setup all --m365 -n <your-agent-name>
-```
+    ```sh
+    a365 develop add-mcp-servers mcp_MailTools
+    ```
 
-4. Capture Generated Files:
+4. Provision the Agent:
+
+    Enter `y` when prompted to assign `Agent365.Observability.OtelWrite` application permission
+
+    ```sh
+    a365 setup all -n <your-agent-name>
+    ```
+
+> Optional: delete agent blueprint client secret
+>
+> ```sh
+> BLUEPRINT_CLIENT_ID=$(python3 -c "import json; print(json.load(open('a365.generated.config.json'))['agentBlueprintId'])")
+> BLUEPRINT_SECRET_ID=$(az ad app credential list --id $BLUEPRINT_CLIENT_ID --query "[].{KeyId:keyId}" -o tsv)
+> az ad app credential delete --id $BLUEPRINT_CLIENT_ID --key-id $BLUEPRINT_SECRET_ID
+> ```
+
+5. Capture Generated Files:
 
 > [!Important]
 >
@@ -225,6 +241,7 @@ flowchart TD
     - Add UAMI as FIC to agent blueprint and Teams bot app
     - Configure redirect URI and agent blueprint API permission on Teams bot app
 6. Configure Required API Permissions & Grant Admin Consent
+    - Add the Sentinel Data Exploration and Triage MCP resources to the agent blueprint's inheritable permissions
     - Assign MCP and API permissions to agent blueprint
     - Grant admin consent for assigned permissions
     - Verify permissions granted
@@ -233,9 +250,7 @@ flowchart TD
 
 ## 3. Post-Deployment Configuration
 
-Upon script completion, note down the printed output values:
-- Messaging Endpoint: `https://<APP_NAME>.<CAE_DOMAIN>/api/messages`
-- OAuth Redirect URI: `https://<APP_NAME>.<CAE_DOMAIN>/auth/callback`
+Note the messaging endpoint output from script completion: `https://<APP_NAME>.<CAE_DOMAIN>/api/messages`
 
 ### 3.1. Configure Azure Bot Service Messaging Endpoint
 1. Go to [Teams Developer Portal - Bot management](https://dev.teams.microsoft.com/tools/bots)

@@ -29,8 +29,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=3978
 
-# Create a non-root system user for security
-RUN groupadd --system app && useradd --system --gid app --home /app app
+# Create a non-root system user and its writable home directory
+RUN groupadd --system app \
+    && useradd --system --gid app --home /app app \
+    && install --directory --owner=app --group=app /app
 
 WORKDIR /app
 

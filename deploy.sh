@@ -160,7 +160,7 @@ print(bp_id)
 AGENTIC_INSTANCE_ID=$(python3 -c "
 import json, sys
 data = json.load(sys.stdin)
-agent_id = data.get('agentIdentityId') or data.get('agentId') or data.get('agenticInstanceId') or data.get('instanceId') or ''
+agent_id = data.get('agenticAppId') or ''
 print(agent_id)
 " < "$CONFIG_FILE" 2>/dev/null || true)
 
@@ -182,7 +182,7 @@ if [ -z "$BLUEPRINT_CLIENT_ID" ]; then
 fi
 
 if [ -z "$AGENTIC_INSTANCE_ID" ]; then
-    log_error "agentIdentityId / agenticInstanceId not found in $CONFIG_FILE."
+    log_error "agenticAppId (Agent Identity) not found in $CONFIG_FILE."
     exit 1
 fi
 
@@ -340,7 +340,7 @@ if redirect_uri not in uris:
 fi
 
 # ------------------------------------------------------------------------------
-# 6. Configure Required API Permissions & Grant Admin Consent (pwsh & az)
+# 6. Configure Inheritable and Required API Permissions & Grant Admin Consent
 # ------------------------------------------------------------------------------
 log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 
@@ -350,7 +350,42 @@ log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 # 3. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, Scope Tools.ListInvoke.All (93aac09f-5f9b-4b4c-aa45-c623a1b69342)
 # 4. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, Scope SecurityIncident.ReadWrite.All (aaad2076-26ab-4905-b1eb-090f627b17d7)
 
-# Step 6A: Update Blueprint App Registration requiredResourceAccess
+# Step 6A: Allow agent identities created from the Blueprint to inherit Sentinel MCP permissions
+BLUEPRINT_OBJECT_ID=$(az ad app show --id "$BLUEPRINT_CLIENT_ID" --query id -o tsv)
+INHERITABLE_PERMISSIONS_ENDPOINT="https://graph.microsoft.com/v1.0/applications/${BLUEPRINT_OBJECT_ID}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions"
+INHERITABLE_PERMISSIONS=$(az rest --method get --url "$INHERITABLE_PERMISSIONS_ENDPOINT" --output json)
+SENTINEL_MCP_RESOURCE_IDS=(
+    "4500ebfb-89b6-4b14-a480-7f749797bfcd"
+    "7b7b3966-1961-47b5-b080-43ca5482e21c"
+)
+
+for resource_app_id in "${SENTINEL_MCP_RESOURCE_IDS[@]}"; do
+    if python3 -c '
+import json, sys
+permissions = json.load(sys.stdin).get("value", [])
+sys.exit(0 if any(item.get("resourceAppId") == sys.argv[1] for item in permissions) else 1)
+' "$resource_app_id" <<< "$INHERITABLE_PERMISSIONS"; then
+        log_info "Sentinel MCP resource $resource_app_id is already inheritable from the Blueprint."
+        continue
+    fi
+
+    log_info "Adding Sentinel MCP resource $resource_app_id as an inheritable Blueprint permission..."
+    INHERITABLE_PERMISSION_BODY=$(python3 -c '
+import json, sys
+print(json.dumps({
+    "resourceAppId": sys.argv[1],
+    "inheritableScopes": {"@odata.type": "microsoft.graph.allAllowedScopes"}
+}))
+' "$resource_app_id")
+    az rest --method post \
+        --url "$INHERITABLE_PERMISSIONS_ENDPOINT" \
+        --headers "Content-Type=application/json" \
+        --body "$INHERITABLE_PERMISSION_BODY" \
+        --output none
+done
+log_success "Sentinel MCP inheritable permissions configured on Blueprint."
+
+# Step 6B: Update Blueprint App Registration requiredResourceAccess
 python3 -c "
 import subprocess, json
 
@@ -398,11 +433,11 @@ log_info "Updating requiredResourceAccess on Blueprint App..."
 az ad app update --id "$BLUEPRINT_CLIENT_ID" --required-resource-accesses @/tmp/soc_buddy_merged_rra.json
 rm -f /tmp/soc_buddy_merged_rra.json
 
-# Step 6B: Attempt admin consent via az cli
+# Step 6C: Attempt admin consent via az cli
 log_info "Attempting admin consent on Blueprint Application..."
 az ad app permission admin-consent --id "$BLUEPRINT_CLIENT_ID" 2>/dev/null || log_info "az ad app permission admin-consent completed or requires elevated admin."
 
-# Step 6C: Use PowerShell Microsoft Graph module to ensure Service Principals and OAuth2PermissionGrants exist
+# Step 6D: Use PowerShell Microsoft Graph module to ensure Service Principals and OAuth2PermissionGrants exist
 log_info "Executing PowerShell Graph commands to ensure tenant-wide delegated grants..."
 pwsh -NoProfile -Command "
     \$ErrorActionPreference = 'Continue'
@@ -460,7 +495,7 @@ pwsh -NoProfile -Command "
                     New-MgOauth2PermissionGrant -ClientId \$clientSp.Id -ResourceId \$resSp.Id -ConsentType 'AllPrincipals' -Scope \$scope | Out-Null
                     Write-Host \"Created new OAuth2PermissionGrant with scope: \$scope\"
                 } catch {
-                    Write-Warning \"Failed to create OAuth2PermissionGrant for \$resourceAppId: \$_\"
+                    Write-Warning \"Failed to create OAuth2PermissionGrant for \${resourceAppId}: \$_\"
                 }
             }
         }
@@ -505,4 +540,3 @@ echo -e "3. ${BOLD}Publish / Activate Agent Manifest in Microsoft 365 Admin Cent
 echo -e "   - Run 'a365 publish' to produce manifest.zip"
 echo -e "   - Upload in M365 Admin Center (Settings > Integrated apps / Agents)"
 echo -e "========================================================================"
-

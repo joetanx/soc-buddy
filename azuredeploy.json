@@ -78,7 +78,7 @@
     "logAnalyticsName": "[format('log-{0}', parameters('appName'))]",
     "caeName": "[format('cae-{0}', parameters('appName'))]",
     "foundryAccountName": "[take(format('foundry-{0}-{1}', variables('cleanAppName'), variables('uniqueSuffix')), 60)]",
-    "cognitiveServicesUserRoleId": "5e644e56-152d-424b-a564-02c16e253f04",
+    "cognitiveServicesUserRoleId": "a97b65f3-24c7-4388-baec-2e87135dc908",
     "acrPullRoleId": "7f951dda-4ed3-4680-a7ca-43fe172d538d"
   },
   "resources": [
