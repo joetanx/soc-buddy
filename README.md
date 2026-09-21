@@ -140,7 +140,7 @@ The a365 CLI requires several human interaction when provisioning agent identity
     Enter `y` when prompted to assign `Agent365.Observability.OtelWrite` application permission
 
     ```sh
-    a365 setup all -n <your-agent-name>
+    a365 setup all -n "<your-agent-name>"
     ```
 
 > Optional: delete agent blueprint client secret
@@ -268,3 +268,49 @@ Note the messaging endpoint output from script completion: `https://<APP_NAME>.<
 7. Select the users or security groups authorized to interact with SOC Buddy → click `Next`
 8. Apply desired policy template → click `Next`
 9. Review the permission → click `Publish`
+
+## 4. Useful commands
+
+### 4.1. Turn on DEBUG for Microsoft OpenTelemetry
+
+Add this line below `logging.basicConfig` in `app/app.py`:
+
+```python
+logging.getLogger("microsoft.opentelemetry.a365.core.exporters").setLevel(logging.DEBUG)
+```
+
+This generates debug logs to verify obervability telemetry exporting.
+
+Example:
+
+```log
+DEBUG:microsoft.opentelemetry.a365.core.exporters.agent365_exporter:HTTP 200 success. Correlation ID: d12d5ea2-92dc-443f-99b4-24ba185f825e. Response: {"results":[{"spanId":"319f552e96c0fc28","sinks":{"flashpoint":{"status":"sent"},"sentinel":{"status":"sent"},"esp":{"status":"sent"}}},{"spanId":"d172e92cc1f237e8","sinks":{"flashpoint":{"status":"se...
+DEBUG:microsoft.opentelemetry.a365.core.exporters.utils:[Agent365Exporter] 14 spans without an eligible gen_ai.operation.name filtered out
+DEBUG:microsoft.opentelemetry.a365.core.exporters.agent365_exporter:Found 1 identity groups with 4 total spans to export
+DEBUG:microsoft.opentelemetry.a365.core.exporters.agent365_exporter:Exporting 4 spans to endpoint: https://agent365.svc.cloud.microsoft/observabilityService/tenants/323626f5-1bfe-48cd-8902-ddfdfd44e1ce/otlp/agents/8b577472-1c66-4586-bb81-a2f626dd0b09/traces?api-version=1 (tenant: 323626f5-1bfe-48cd-8902-ddfdfd44e1ce, agent: 8b577472-1c66-4586-bb81-a2f626dd0b09)
+INFO:microsoft_agents.authentication.msal.msal_auth:Attempting to get agentic application token from agent_app_instance_id 8b577472-1c66-4586-bb81-a2f626dd0b09
+DEBUG:microsoft.opentelemetry.a365.core.exporters.agent365_exporter:Prepared chunk 1 of 1 (4 spans, 6339 bytes)
+DEBUG:microsoft.opentelemetry.a365.core.exporters.agent365_exporter:HTTP 200 success. Correlation ID: 1c47d51d-b5b2-4e07-8bd1-3004a1c91ae0. Response: {"results":[{"spanId":"aaa6139ffc5ed9f2","sinks":{"flashpoint":{"status":"sent"},"sentinel":{"status":"sent"},"esp":{"status":"sent"}}},{"spanId":"669b21bfcd1109be","sinks":{"flashpoint":{"status":"se...
+```
+
+### 4.2. Manually rebuilding container image
+
+```sh
+az acr build -r $ACR_NAME -t $APP_NAME:latest -f Dockerfile .
+```
+
+### 4.3. Query region for model capacity limit and current usage
+
+```sh
+az cognitiveservices usage list --location $LOCATION --query "[?contains(name.value, '$MODEL_NAME')]"
+```
+
+### 4.4. Delete and purge Foundry resource
+
+In event of re-setup with same name, delete and purge the Foundry resource manually, then delete the resource group
+
+```sh
+az cognitiveservices account delete -n $FOUNDRY_NAME$ -g $RG
+az cognitiveservices account purge -n $FOUNDRY_NAME$ -g $RG -l $LOCATION
+az group delete -n $RG
+```

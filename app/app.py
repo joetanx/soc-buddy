@@ -1,5 +1,4 @@
 import sys, logging, asyncio, json
-from html import escape
 from os import environ
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Optional, Any
@@ -45,7 +44,6 @@ from msgraph.generated.models.security.alert_determination import AlertDetermina
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
-logger = logging.getLogger(__name__)
 
 # Initialize Microsoft 365 Agents SDK configurations and agent application.
 agents_sdk_config = load_configuration_from_env(environ)
@@ -63,6 +61,12 @@ tenant_id = agents_sdk_config['CONNECTIONS']['SERVICE_CONNECTION']['SETTINGS']['
 
 # Initialize global MSAL token cache.
 msal_token_cache = msal.SerializableTokenCache()
+
+def parse_msal_response(msal_response: dict[str, Any]) -> str:
+    access_token = msal_response.get("access_token")
+    if access_token:
+        return access_token
+    raise RuntimeError(f"MSAL token acquisition failed: {msal_response}")
 
 
 # Token acquisition methods for agent ID.
@@ -85,9 +89,11 @@ async def get_agent_id_msal_app() -> msal.ConfidentialClientApplication:
 
 async def get_observability_token() -> str:
     # Get agent ID s2s observability token.
-    return (await get_agent_id_msal_app()).acquire_token_for_client(
-        scopes=["api://9b975845-388f-4429-889e-eab1ef63949c/.default"]
-    )["access_token"]
+    return parse_msal_response(
+        (await get_agent_id_msal_app()).acquire_token_for_client(
+            scopes=["api://9b975845-388f-4429-889e-eab1ef63949c/.default"]
+        )
+    )
 
 
 # Token acquisition methods for Teams bot.
@@ -112,21 +118,15 @@ agentbp_scope = f"api://{agents_sdk_config['CONNECTIONS']['AGENTIC']['SETTINGS']
 class AuthenticationRequired(Exception):
     pass
 
-class TokenAcquisitionError(Exception):
-    pass
-
 async def trigger_auth_code_flow(continuation_activity: Activity,) -> str:
     # Trigger Teams bot authorization code flow for human user authentication.
-    try:
-        flow = get_teams_bot_msal_app().initiate_auth_code_flow(
-            scopes=[agentbp_scope],
-            redirect_uri=environ["OAUTH_REDIRECT_URI"],
-            response_mode="form_post",
-        )
-        auth_requests[flow["state"]] = (flow, continuation_activity)
-        return flow["auth_uri"]
-    except Exception as error:
-        raise TokenAcquisitionError(f"Failed to trigger auth code flow: {error}")
+    flow = get_teams_bot_msal_app().initiate_auth_code_flow(
+        scopes=[agentbp_scope],
+        redirect_uri=environ["OAUTH_REDIRECT_URI"],
+        response_mode="form_post",
+    )
+    auth_requests[flow["state"]] = (flow, continuation_activity)
+    return flow["auth_uri"]
 
 async def redeem_auth_code(
     state: str | None,
@@ -137,15 +137,12 @@ async def redeem_auth_code(
     if auth_request is None:
         raise AuthenticationRequired("Authorization flow not found or expired.")
     flow, continuation_activity = auth_request
-    try:
-        # Redeem authorization code for access and refresh tokens, native msal client handles caching them in msal_token_cache.
-        get_teams_bot_msal_app().acquire_token_by_auth_code_flow(flow, auth_response)["access_token"]
-        # Clear authorization request from cache after redemption.
-        auth_requests.pop(state, None)
-        # Return continuation activity to proceed with bot conversation.
-        return continuation_activity
-    except Exception as error:
-        raise TokenAcquisitionError(f"Failed to redeem auth code for tokens: {error}")
+    # Redeem authorization code for access and refresh tokens, native msal client handles caching them in msal_token_cache.
+    parse_msal_response(get_teams_bot_msal_app().acquire_token_by_auth_code_flow(flow, auth_response))
+    # Clear authorization request from cache after redemption.
+    auth_requests.pop(state, None)
+    # Return continuation activity to proceed with bot conversation.
+    return continuation_activity
 
 async def get_obo_token(user_id: str, scopes: list[str]) -> str:
     account = next(
@@ -159,19 +156,20 @@ async def get_obo_token(user_id: str, scopes: list[str]) -> str:
     )
     if not account:
         raise AuthenticationRequired("User account not found for silent token acquisition.")
-    try:
-        user_assertion = get_teams_bot_msal_app().acquire_token_silent_with_error(
-            # Get access token in cache or use refresh token in cache to get access token, raise error if none available.
+    user_assertion = parse_msal_response(
+        get_teams_bot_msal_app().acquire_token_silent_with_error(
+            # Get access token in cache or use refresh token in cache to get access token.
             [agentbp_scope],
             account=account
-        )["access_token"]
-        return (await get_agent_id_msal_app()).acquire_token_on_behalf_of(
+        )
+    )
+    return parse_msal_response(
+        (await get_agent_id_msal_app()).acquire_token_on_behalf_of(
             # Get OBO token with user assertion.
             user_assertion=user_assertion,
             scopes=scopes
-        )["access_token"]
-    except Exception as error:
-        raise TokenAcquisitionError(f"Agent OBO token acquisition failed: {error}")
+        )
+    )
 
 
 def authentication_card(auth_url: str) -> Activity:
@@ -436,13 +434,6 @@ def main() -> None:
                 )
                 await context.send_activity(authentication_card(auth_url))
                 return
-            except TokenAcquisitionError:
-                # Handle any token acquisition errors.
-                logger.exception("Could not configure MCP authorization")
-                await context.send_activity(
-                    "The agent could not acquire delegated access. Contact an administrator to verify agent permissions and consent."
-                )
-                return
             agent = setup_agent([current_utc_time, WebSearchTool(), *mcp_tools, *graph_tools])
             # Invoke the agent with the user's message and the current thread ID.
             result = await agent.ainvoke(
@@ -462,45 +453,22 @@ def main() -> None:
             # Retrieve authentication response redirected from Entra.
             await request.post() if request.method == "POST" else request.query
         )
-        try:
-            # Redeem the authorization code for access and refresh tokens.
-            continuation_activity = await redeem_auth_code(
-                state=auth_response.get("state"),
-                auth_response=auth_response,
+        # Redeem the authorization code for access and refresh tokens.
+        continuation_activity = await redeem_auth_code(
+            state=auth_response.get("state"),
+            auth_response=auth_response,
+        )
+        async def notify_success(context: TurnContext) -> None:
+            await context.send_activity(
+                "Authentication is complete. Retry your previous message."
             )
-            async def notify_success(context: TurnContext) -> None:
-                await context.send_activity(
-                    "Authentication is complete. Retry your previous message."
-                )
-            await adapter.continue_conversation(
-                agent_id,
-                continuation_activity,
-                notify_success,
-            )
-            body = f"<h1>Authentication complete</h1><p>Signed in as {continuation_activity.from_property.name}. Return to Teams and retry your message.</p>"
-            return Response(text=body, content_type="text/html")
-        except TokenAcquisitionError as error:
-            logger.exception("Failed to redeem auth code for tokens")
-            if continuation_activity:
-                # Notify user of authentication failure if continuation activity is available.
-                async def notify_failure(context: TurnContext) -> None:
-                    await context.send_activity(
-                        "Authentication failed. Return to Teams and start sign-in again."
-                    )
-                try:
-                    await adapter.continue_conversation(
-                        agent_id,
-                        continuation_activity,
-                        notify_failure,
-                    )
-                except Exception:
-                    logger.exception("Could not notify user of authentication failure")
-            if "invalid or expired" in str(error) or "request expired" in str(error):
-                message = str(error)
-            else:
-                message = "Authentication could not be completed. Return to Teams and start sign-in again."
-            body = f"<h1>Authentication failed</h1><p>{escape(message)}</p>"
-            return Response(text=body, content_type="text/html", status=400)
+        await adapter.continue_conversation(
+            agent_id,
+            continuation_activity,
+            notify_success,
+        )
+        body = f"<h1>Authentication complete</h1><p>Signed in as {continuation_activity.from_property.name}. Return to Teams and retry your message.</p>"
+        return Response(text=body, content_type="text/html")
 
     app = Application()
     app.router.add_post("/api/messages", entry_point)

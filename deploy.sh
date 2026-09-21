@@ -49,16 +49,16 @@ if ! command -v python3 &> /dev/null; then
 fi
 
 # Ensure user is logged into Azure CLI
-CURRENT_SUB_ID=$(az account show --query id -o tsv 2>/dev/null || true)
-if [ -z "$CURRENT_SUB_ID" ]; then
+SUB_ID=$(az account show --query id -o tsv 2>/dev/null || true)
+if [ -z "$SUB_ID" ]; then
     log_error "Not logged into Azure CLI. Please run 'az login' first."
     exit 1
 fi
-CURRENT_TENANT_ID=$(az account show --query tenantId -o tsv)
-CURRENT_SUB_NAME=$(az account show --query name -o tsv)
+TENANT_ID=$(az account show --query tenantId -o tsv)
+SUB_NAME=$(az account show --query name -o tsv)
 
-log_info "Active Subscription: ${BOLD}${CURRENT_SUB_NAME}${NC} (${CURRENT_SUB_ID})"
-log_info "Active Tenant ID:    ${BOLD}${CURRENT_TENANT_ID}${NC}"
+log_info "Tenant ID:    ${BOLD}${TENANT_ID}${NC}"
+log_info "Subscription: ${BOLD}${SUB_NAME}${NC} (${SUB_ID})"
 
 # Ensure Azure Resource Providers are registered
 register_provider_if_needed() {
@@ -151,30 +151,12 @@ log_info "Foundry Model:      ${BOLD}${FOUNDRY_MODEL}${NC}"
 log_info "Parsing configuration from: $CONFIG_FILE"
 
 BLUEPRINT_CLIENT_ID=$(python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-bp_id = data.get('agentBlueprintId') or data.get('agentBlueprintClientId') or data.get('blueprintClientId') or data.get('blueprintId') or ''
-print(bp_id)
-" < "$CONFIG_FILE" 2>/dev/null || true)
+import json
+print(json.load(open('$CONFIG_FILE'))['agentBlueprintId'])" 2>/dev/null || true)
 
 AGENTIC_INSTANCE_ID=$(python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-agent_id = data.get('agenticAppId') or ''
-print(agent_id)
-" < "$CONFIG_FILE" 2>/dev/null || true)
-
-TENANT_ID=$(python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-t_id = data.get('tenantId')
-if not t_id:
-    try:
-        t_id = json.load(open('$SCRIPT_DIR/a365.config.json')).get('tenantId')
-    except Exception:
-        pass
-print(t_id or '$CURRENT_TENANT_ID')
-" < "$CONFIG_FILE" 2>/dev/null || echo "$CURRENT_TENANT_ID")
+import json
+print(json.load(open('$CONFIG_FILE'))['agenticAppId'])" 2>/dev/null || true)
 
 if [ -z "$BLUEPRINT_CLIENT_ID" ]; then
     log_error "agentBlueprintId not found in $CONFIG_FILE."
@@ -200,8 +182,7 @@ fi
 
 # Query model version dynamically for the requested model in the given location
 log_info "Resolving model version for '${FOUNDRY_MODEL}' in '${LOCATION}'..."
-FOUNDRY_MODEL_VERSION=$(az cognitiveservices model list \
-    -l "$LOCATION" \
+FOUNDRY_MODEL_VERSION=$(az cognitiveservices model list -l "$LOCATION" \
     --query "[?model.name=='${FOUNDRY_MODEL}' && kind=='AIServices'].model.version | sort(@) | [-1]" \
     -o tsv 2>/dev/null || true)
 
@@ -345,15 +326,16 @@ fi
 log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 
 # Permission Definitions:
-# 1. Sentinel MCP Data Exploration: App 4500ebfb-89b6-4b14-a480-7f749797bfcd, Scope SentinelPlatform.DelegatedAccess (eaff9684-612c-4add-aa10-035fd3bfe3d1)
-# 2. Sentinel MCP Triage:           App 7b7b3966-1961-47b5-b080-43ca5482e21c, Scope MCP.Read.All (8dd500d0-c3aa-4380-96d1-09b4b6233eff)
-# 3. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, Scope Tools.ListInvoke.All (93aac09f-5f9b-4b4c-aa45-c623a1b69342)
-# 4. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, Scope SecurityIncident.ReadWrite.All (aaad2076-26ab-4905-b1eb-090f627b17d7)
+# 1. Sentinel MCP Data Exploration: App 4500ebfb-89b6-4b14-a480-7f749797bfcd, SPN eaff9684-612c-4add-aa10-035fd3bfe3d1, Scope SentinelPlatform.DelegatedAccess
+# 2. Sentinel MCP Triage:           App 7b7b3966-1961-47b5-b080-43ca5482e21c, SPN 8dd500d0-c3aa-4380-96d1-09b4b6233eff, Scope MCP.Read.All
+# 3. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, SPN 93aac09f-5f9b-4b4c-aa45-c623a1b69342, Scope Tools.ListInvoke.All
+# 4. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, Scope SecurityIncident.ReadWrite.All
 
 # Step 6A: Allow agent identities created from the Blueprint to inherit Sentinel MCP permissions
 BLUEPRINT_OBJECT_ID=$(az ad app show --id "$BLUEPRINT_CLIENT_ID" --query id -o tsv)
 INHERITABLE_PERMISSIONS_ENDPOINT="https://graph.microsoft.com/v1.0/applications/${BLUEPRINT_OBJECT_ID}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions"
 INHERITABLE_PERMISSIONS=$(az rest --method get --url "$INHERITABLE_PERMISSIONS_ENDPOINT" --output json)
+# This section only handles Sentinel MCP inheritable permissions as Graph and Work IQ are covered by a365 CLI
 SENTINEL_MCP_RESOURCE_IDS=(
     "4500ebfb-89b6-4b14-a480-7f749797bfcd"
     "7b7b3966-1961-47b5-b080-43ca5482e21c"
