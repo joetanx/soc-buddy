@@ -221,6 +221,7 @@ sequenceDiagram
 | Microsoft Defender Mcp<br>(Sentinel MCP Triage) | `7b7b3966-1961-47b5-b080-43ca5482e21c` | `8dd500d0-c3aa-4380-96d1-09b4b6233eff` | `MCP.Read.All` | Delegated (OBO) | Inspect Defender XDR incidents, alert evidence, impacted devices, and identities. |
 | Work IQ Mail MCP | `16b1878d-62c7-4009-aa25-68989d63bbad` | `93aac09f-5f9b-4b4c-aa45-c623a1b69342` | `Tools.ListInvoke.All` | Delegated (OBO) | Read analyst email notifications, search incident email threads, draft communications. |
 | Microsoft Graph | `00000003-0000-0000-c000-000000000000` | `aaad2076-26ab-4905-b1eb-090f627b17d7` | `SecurityIncident.ReadWrite.All` | Delegated (OBO) | Post comments to incidents and update status, classification, determination, and tags. |
+| Microsoft Graph | `00000003-0000-0000-c000-000000000000` | `b152eca8-ea73-4a48-8c98-1a6742673d99` | `ThreatHunting.Read.All` | Delegated (OBO) | Run Microsoft Defender hunting queries on behalf of the signed-in analyst. |
 | Agent365Observability | `9b975845-388f-4429-889e-eab1ef63949c` | `a3af7c4d-8203-45c5-a467-ea084e2bbcfa` | `Agent365.Observability.OtelWrite` | Application (S2S) | Export agent spans, traces, and metrics to Microsoft Agent 365 control plane. |
 
 ### 2.2. Sentinel MCP Data Exploration Tools
@@ -265,9 +266,21 @@ sequenceDiagram
 
 Implemented natively in Python using the `msgraph-sdk` and `GraphServiceClient`.
 - Target URL: `https://graph.microsoft.com/v1.0/security/incidents`
-- Authentication: Bearer token with scope `https://graph.microsoft.com/.default` (negotiated with `SecurityIncident.ReadWrite.All`)
+- Authentication: Bearer token with scope `https://graph.microsoft.com/.default` (negotiated with `SecurityIncident.ReadWrite.All` and `ThreatHunting.Read.All`)
 
-#### 2.5.1. `add_incident_comment`
+#### 2.5.1. Threat Hunting Tools
+
+| Tool | Description | Key Parameters |
+|---|---|---|
+| `run_hunting_query` | Executes custom KQL hunts not covered by a dedicated hunting tool. | `query`, `timespan`, `workspace_id` |
+| `search_threat_intelligence` | Checks indicators against the latest matching `ThreatIntelIndicators` records. | `indicators`, `timespan` |
+| `hunt_user_blast_radius` | Searches `SigninLogs.Identity`, `SecurityEvent.Account`, and `Syslog.SyslogMessage` for incident user entities. | `users`, `timespan`, `workspace_id` |
+| `hunt_host_blast_radius` | Searches `SecurityEvent.Computer` and `Syslog.HostName` for incident host entities. | `hosts`, `timespan`, `workspace_id` |
+| `hunt_ip_blast_radius` | Searches `SigninLogs.IPAddress`, `SecurityEvent.IpAddress`, and `Syslog.SyslogMessage` for incident IP entities. | `ip_addresses`, `timespan`, `workspace_id` |
+
+The blast-radius tools combine their table-specific hunts with `union`, identify each result's source table, normalize `SigninLogs.IPAddress` and `SecurityEvent.IpAddress` to `SourceIp`, and default to the previous 72 hours (`P3D`). All other event fields are preserved. The dedicated tools should be preferred over generated KQL for incident user, host, and IP address entities. The general `run_hunting_query` tool remains available for other custom hunts.
+
+#### 2.5.2. `add_incident_comment`
 - Description: Appends an analytical comment or investigation note to a security incident.
 - Parameters:
     | Parameter | Type | Description |
@@ -276,7 +289,7 @@ Implemented natively in Python using the `msgraph-sdk` and `GraphServiceClient`.
     | `comment` | `str` | Body text of the comment to record. |
 - REST Equivalent: `POST https://graph.microsoft.com/v1.0/security/incidents/{incident_id}/comments`
 
-#### 2.5.2. `update_incident`
+#### 2.5.3. `update_incident`
 - Description: Updates incident lifecycle state, owner assignment, classification, determination, and tags.
 - Parameters:
     | Parameter | Type | Description |

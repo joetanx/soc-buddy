@@ -1,6 +1,6 @@
-import sys, logging, asyncio, json
+import sys, logging, asyncio, json, re
 from os import environ
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Optional, Any
 from pydantic import Field
 from enum import Enum
@@ -34,9 +34,28 @@ from microsoft.opentelemetry import use_microsoft_opentelemetry
 from microsoft.opentelemetry.a365.core import BaggageBuilder
 from microsoft.opentelemetry.a365.hosting.scope_helpers.populate_baggage import populate
 
+# for parsing graph security models
+from kiota_serialization_json.json_serialization_writer import JsonSerializationWriter
+from kiota_abstractions.serialization import Parsable
+
+# base graph client dependencies
 from azure.core.credentials import AccessToken
 from msgraph import GraphServiceClient
+
+# comments for incident are actually of AlertComment type
 from msgraph.generated.models.security.alert_comment import AlertComment
+
+# to synthesize query parameters for list incidents and list alerts
+from kiota_abstractions.base_request_configuration import RequestConfiguration
+from msgraph.generated.security.incidents.incidents_request_builder import IncidentsRequestBuilder
+
+# to synthesize request body for run hunting query
+from msgraph.generated.security.microsoft_graph_security_run_hunting_query.run_hunting_query_post_request_body import RunHuntingQueryPostRequestBody
+
+# comments for incident are actually of AlertComment type
+from msgraph.generated.models.security.alert_comment import AlertComment
+
+# use for updating incident
 from msgraph.generated.models.security.incident import Incident
 from msgraph.generated.models.security.incident_status import IncidentStatus
 from msgraph.generated.models.security.alert_classification import AlertClassification
@@ -258,35 +277,10 @@ async def get_graph_client(user_id: str) -> GraphServiceClient:
         GraphAccessTokenProvider(graph_token)
     )
 
-def _json_value(value: Any) -> Any:
-    """Convert Graph SDK response values to JSON-compatible data."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {str(key): _json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_value(item) for item in value]
-
-    additional_data = getattr(value, "additional_data", None)
-    if additional_data:
-        return _json_value(additional_data)
-
-    backing_store = getattr(value, "backing_store", None)
-    if backing_store and hasattr(backing_store, "enumerate_"):
-        return {
-            key: _json_value(item)
-            for key, item in backing_store.enumerate_()
-            if item is not None and key != "additional_data"
-        }
-
-    return str(value)
-
-def _response_json(value: Any) -> str:
-    return json.dumps(_json_value(value), indent=2, ensure_ascii=True)
+def _response_json(value: Parsable | list[Parsable]) -> str:
+    writer = JsonSerializationWriter()
+    writer.write_any_value(None, value)
+    return writer.get_serialized_content().decode("utf-8")
 
 def _parse_enum(enum_type: type[Enum], value: str) -> Enum:
     normalized = value.strip().lower()
@@ -296,9 +290,165 @@ def _parse_enum(enum_type: type[Enum], value: str) -> Enum:
     choices = ", ".join(str(member.value) for member in enum_type)
     raise ValueError(f"Invalid {enum_type.__name__} '{value}'. Expected one of: {choices}")
 
+def _kql_values(values: list[str], entity_type: str) -> list[str]:
+    normalized_values = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+    if not normalized_values:
+        raise ValueError(f"Provide at least one {entity_type}.")
+    return normalized_values
+
+def _kql_string_list(values: list[str], entity_type: str) -> str:
+    return ", ".join(json.dumps(value) for value in _kql_values(values, entity_type))
+
+def _kql_search_regex(values: list[str], entity_type: str) -> str:
+    escaped_values = "|".join(re.escape(value) for value in _kql_values(values, entity_type))
+    return json.dumps(f"(?i)(?:{escaped_values})")
+
 async def get_graph_tools(user_id: str) -> list[BaseTool]:
     
     graph_client = await get_graph_client(user_id)
+
+    @tool
+    async def get_incident_with_alerts(
+        incident_id: Annotated[str, Field(description='Incident ID')]
+    ) -> str:
+        """Get one Microsoft security incident and its associated alerts."""
+        attempts = int(environ.get("INCIDENT_FETCH_ATTEMPTS", "5"))
+        delay = int(environ.get("INCIDENT_FETCH_DELAY_SECONDS", "15"))
+        query_params = IncidentsRequestBuilder.IncidentsRequestBuilderGetQueryParameters(
+            filter = f"id eq '{incident_id}'",
+            expand = ["alerts"],
+        )
+        request_configuration = RequestConfiguration(
+            query_parameters = query_params,
+        )
+        for attempt in range(1, attempts + 1):
+            # List incident with filter for incident ID and expand alerts
+            # A single-item list of `msgraph.generated.models.security.incident.Incident` is returned when filtering for an incident ID
+            incident = await graph_client.security.incidents.get(request_configuration = request_configuration)
+            # If the incident is not found, wait and retry, up to the maximum number of attempts
+            if not incident.value:
+                if attempt == attempts:
+                    raise LookupError(
+                        f"Incident {incident_id} was not found after {attempts} attempts"
+                    )
+                wait_seconds = min(delay * (2 ** (attempt - 1)), 60)
+                await asyncio.sleep(wait_seconds)
+                continue
+            return _response_json(incident.value[0])
+
+    async def _run_hunting_query(
+        query: str,
+        timespan: Optional[str] = 'P7D',
+        workspace_id: Optional[str] = None,
+    ) -> str:
+        request_body = RunHuntingQueryPostRequestBody(query=query, timespan=timespan)
+        if workspace_id is not None:
+            request_body.additional_data["workspaceId"] = workspace_id
+        response = await graph_client.security.microsoft_graph_security_run_hunting_query.post(request_body)
+        return _response_json(response.results)
+
+    @tool
+    async def run_hunting_query(
+        query: Annotated[str, Field(description='Custom KQL threat-hunting query. Use the dedicated blast-radius tools instead when searching incident user, host, or IP address entities.')],
+        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P7D',
+        workspace_id: Annotated[Optional[str], Field(description='Log Analytics workspace GUID')] = None,
+    ) -> str:
+        """Run custom KQL that is not covered by a dedicated hunting tool."""
+        return await _run_hunting_query(
+            query=query,
+            timespan=timespan,
+            workspace_id=workspace_id,
+        )
+
+    @tool
+    async def search_threat_intelligence(
+        indicators: Annotated[list[str], Field(description='List of indicator observables (IP addresses, domain names, URLs, hashes) to check against Microsoft Threat Intelligence.')],
+        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P7D',
+    ) -> str:
+        """Tool that abstracts KQL against ThreatIntelIndicators to check Microsoft Threat Intelligence for indicators matches."""
+        query = (
+            "ThreatIntelIndicators\n"
+            f"| where ObservableValue in~ ({_kql_string_list(indicators, 'indicator')})\n"
+            "| project Modified, ObservableKey, ObservableValue, IsActive, Confidence\n"
+            "| summarize arg_max(Modified, *) by ObservableValue"
+        )
+        return await _run_hunting_query(query=query, timespan=timespan)
+
+    @tool
+    async def hunt_user_blast_radius(
+        users: Annotated[list[str], Field(description='User names, account names, or identities observed in an incident')],
+        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P3D',
+        workspace_id: Annotated[Optional[str], Field(description='Log Analytics workspace GUID')] = None,
+    ) -> str:
+        """Find occurrences of incident user entities across sign-in, Windows security, and Syslog events."""
+        search_users = _kql_search_regex(users, "user")
+        query = (
+            "union withsource=SourceTable\n"
+            "    (SigninLogs\n"
+            f"    | where Identity matches regex {search_users}\n"
+            "    | project-rename SourceIp = IPAddress),\n"
+            "    (SecurityEvent\n"
+            f"    | where Account matches regex {search_users}\n"
+            "    | project-rename SourceIp = IpAddress),\n"
+            "    (Syslog\n"
+            f"    | where SyslogMessage matches regex {search_users})\n"
+            "| order by TimeGenerated desc"
+        )
+        return await _run_hunting_query(
+            query=query,
+            timespan=timespan,
+            workspace_id=workspace_id,
+        )
+
+    @tool
+    async def hunt_host_blast_radius(
+        hosts: Annotated[list[str], Field(description='Host or computer names observed in an incident')],
+        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P3D',
+        workspace_id: Annotated[Optional[str], Field(description='Log Analytics workspace GUID')] = None,
+    ) -> str:
+        """Find occurrences of incident host entities across Windows security and Syslog events."""
+        search_hosts = _kql_search_regex(hosts, "host")
+        query = (
+            "union withsource=SourceTable\n"
+            "    (SecurityEvent\n"
+            f"    | where Computer matches regex {search_hosts}\n"
+            "    | project-rename SourceIp = IpAddress),\n"
+            "    (Syslog\n"
+            f"    | where HostName matches regex {search_hosts})\n"
+            "| order by TimeGenerated desc"
+        )
+        return await _run_hunting_query(
+            query=query,
+            timespan=timespan,
+            workspace_id=workspace_id,
+        )
+
+    @tool
+    async def hunt_ip_blast_radius(
+        ip_addresses: Annotated[list[str], Field(description='IP addresses observed in an incident')],
+        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P3D',
+        workspace_id: Annotated[Optional[str], Field(description='Log Analytics workspace GUID')] = None,
+    ) -> str:
+        """Find occurrences of incident IP address entities across sign-in, Windows security, and Syslog events."""
+        search_ip_list = _kql_string_list(ip_addresses, "IP address")
+        search_ip_regex = _kql_search_regex(ip_addresses, "IP address")
+        query = (
+            "union withsource=SourceTable\n"
+            "    (SigninLogs\n"
+            f"    | where IPAddress in~ ({search_ip_list})\n"
+            "    | project-rename SourceIp = IPAddress),\n"
+            "    (SecurityEvent\n"
+            f"    | where IpAddress in~ ({search_ip_list})\n"
+            "    | project-rename SourceIp = IpAddress),\n"
+            "    (Syslog\n"
+            f"    | where SyslogMessage matches regex {search_ip_regex})\n"
+            "| order by TimeGenerated desc"
+        )
+        return await _run_hunting_query(
+            query=query,
+            timespan=timespan,
+            workspace_id=workspace_id,
+        )
 
     @tool
     async def add_incident_comment(
@@ -342,6 +492,12 @@ async def get_graph_tools(user_id: str) -> list[BaseTool]:
         return _response_json(response) if response else f"Incident {incident_id} updated."
 
     return [
+        get_incident_with_alerts,
+        run_hunting_query,
+        search_threat_intelligence,
+        hunt_user_blast_radius,
+        hunt_host_blast_radius,
+        hunt_ip_blast_radius,
         add_incident_comment,
         update_incident,
     ]
@@ -349,14 +505,15 @@ async def get_graph_tools(user_id: str) -> list[BaseTool]:
 # MCP server tools
 
 MCP_SERVERS = {
-    "sentinel-mcp-data-exploration": (
-        "https://sentinel.microsoft.com/mcp/data-exploration",
-        ["4500ebfb-89b6-4b14-a480-7f749797bfcd/SentinelPlatform.DelegatedAccess"],
-    ),
-    "sentinel-mcp-defender-triage": (
-        "https://sentinel.microsoft.com/mcp/triage",
-        ["7b7b3966-1961-47b5-b080-43ca5482e21c/MCP.Read.All"],
-    ),
+    # Sentinel MCP servers are deprecated.
+    # "sentinel-mcp-data-exploration": (
+    #     "https://sentinel.microsoft.com/mcp/data-exploration",
+    #     ["4500ebfb-89b6-4b14-a480-7f749797bfcd/SentinelPlatform.DelegatedAccess"],
+    # ),
+    # "sentinel-mcp-defender-triage": (
+    #     "https://sentinel.microsoft.com/mcp/triage",
+    #     ["7b7b3966-1961-47b5-b080-43ca5482e21c/MCP.Read.All"],
+    # ),
     "work-iq-mail": (
         "https://agent365.svc.cloud.microsoft/agents/servers/mcp_MailTools",
         ["16b1878d-62c7-4009-aa25-68989d63bbad/Tools.ListInvoke.All"],

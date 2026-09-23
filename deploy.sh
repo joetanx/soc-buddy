@@ -6,10 +6,11 @@
 # in Azure Container Registry (ACR), configures Managed Identity,
 # sets up Federated Identity Credentials (FIC) for Agent Blueprint & Teams Bot,
 # and grants delegated permissions for Microsoft Sentinel MCPs, Work IQ Mail MCP,
-# and Microsoft Graph Security Incidents.
+# and Microsoft Graph Security Incidents and Threat Hunting.
 # ==============================================================================
 
 set -euo pipefail
+exec > "deploy_$(date +%F_%T).log" 2>&1
 
 # Text formatting
 RED='\033[0;31m'
@@ -326,10 +327,11 @@ fi
 log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 
 # Permission Definitions:
-# 1. Sentinel MCP Data Exploration: App 4500ebfb-89b6-4b14-a480-7f749797bfcd, SPN eaff9684-612c-4add-aa10-035fd3bfe3d1, Scope SentinelPlatform.DelegatedAccess
-# 2. Sentinel MCP Triage:           App 7b7b3966-1961-47b5-b080-43ca5482e21c, SPN 8dd500d0-c3aa-4380-96d1-09b4b6233eff, Scope MCP.Read.All
-# 3. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, SPN 93aac09f-5f9b-4b4c-aa45-c623a1b69342, Scope Tools.ListInvoke.All
-# 4. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, Scope SecurityIncident.ReadWrite.All
+# 1. Sentinel MCP Data Exploration: App 4500ebfb-89b6-4b14-a480-7f749797bfcd, SPN eaff9684-612c-4add-aa10-035fd3bfe3d1, DelegatedRoleId 991a963a-4203-4dbc-acf2-254a258f76f2, Scope SentinelPlatform.DelegatedAccess
+# 2. Sentinel MCP Triage:           App 7b7b3966-1961-47b5-b080-43ca5482e21c, SPN 8dd500d0-c3aa-4380-96d1-09b4b6233eff, DelegatedRoleId 69b8d760-4df6-4017-a3e6-1a8049cbce42, Scope MCP.Read.All
+# 3. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, SPN 93aac09f-5f9b-4b4c-aa45-c623a1b69342, DelegatedRoleId fa91a9e8-6808-4167-a950-8f1fe525b270, Scope Tools.ListInvoke.All
+# 4. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId 128ca929-1a19-45e6-a3b8-435ec44a36ba, Scope SecurityIncident.ReadWrite.All
+#                                   App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId b152eca8-ea73-4a48-8c98-1a6742673d99, Scope ThreatHunting.Read.All
 
 # Step 6A: Allow agent identities created from the Blueprint to inherit Sentinel MCP permissions
 BLUEPRINT_OBJECT_ID=$(az ad app show --id "$BLUEPRINT_CLIENT_ID" --query id -o tsv)
@@ -378,19 +380,22 @@ current_rra = json.loads(current_rra_str) if current_rra_str and current_rra_str
 target_permissions = [
     {
         'resourceAppId': '4500ebfb-89b6-4b14-a480-7f749797bfcd',
-        'resourceAccess': [{'id': 'eaff9684-612c-4add-aa10-035fd3bfe3d1', 'type': 'Scope'}]
+        'resourceAccess': [{'id': '991a963a-4203-4dbc-acf2-254a258f76f2', 'type': 'Scope'}]
     },
     {
         'resourceAppId': '7b7b3966-1961-47b5-b080-43ca5482e21c',
-        'resourceAccess': [{'id': '8dd500d0-c3aa-4380-96d1-09b4b6233eff', 'type': 'Scope'}]
+        'resourceAccess': [{'id': '69b8d760-4df6-4017-a3e6-1a8049cbce42', 'type': 'Scope'}]
     },
     {
         'resourceAppId': '16b1878d-62c7-4009-aa25-68989d63bbad',
-        'resourceAccess': [{'id': '93aac09f-5f9b-4b4c-aa45-c623a1b69342', 'type': 'Scope'}]
+        'resourceAccess': [{'id': 'fa91a9e8-6808-4167-a950-8f1fe525b270', 'type': 'Scope'}]
     },
     {
         'resourceAppId': '00000003-0000-0000-c000-000000000000',
-        'resourceAccess': [{'id': 'aaad2076-26ab-4905-b1eb-090f627b17d7', 'type': 'Scope'}]
+        'resourceAccess': [
+            {'id': '128ca929-1a19-45e6-a3b8-435ec44a36ba', 'type': 'Scope'},
+            {'id': 'b152eca8-ea73-4a48-8c98-1a6742673d99', 'type': 'Scope'}
+        ]
     }
 ]
 
@@ -442,12 +447,12 @@ pwsh -NoProfile -Command "
         '4500ebfb-89b6-4b14-a480-7f749797bfcd' = 'SentinelPlatform.DelegatedAccess'
         '7b7b3966-1961-47b5-b080-43ca5482e21c' = 'MCP.Read.All'
         '16b1878d-62c7-4009-aa25-68989d63bbad' = 'Tools.ListInvoke.All'
-        '00000003-0000-0000-c000-000000000000' = 'SecurityIncident.ReadWrite.All'
+        '00000003-0000-0000-c000-000000000000' = @('SecurityIncident.ReadWrite.All', 'ThreatHunting.Read.All')
     }
 
     foreach (\$resourceAppId in \$resources.Keys) {
-        \$scope = \$resources[\$resourceAppId]
-        Write-Host \"Configuring grant for Resource: \$resourceAppId, Scope: \$scope...\"
+        \$requiredScopes = @(\$resources[\$resourceAppId])
+        Write-Host \"Configuring grant for Resource: \$resourceAppId, Scopes: \$(\$requiredScopes -join ' ')...\"
         
         # Ensure resource service principal exists
         \$resSp = Get-MgServicePrincipal -Filter \"appId eq '\$resourceAppId'\" -ErrorAction SilentlyContinue
@@ -464,18 +469,20 @@ pwsh -NoProfile -Command "
             \$grant = Get-MgOauth2PermissionGrant -Filter \"clientId eq '\$(\$clientSp.Id)' and resourceId eq '\$(\$resSp.Id)'\" -ErrorAction SilentlyContinue
             if (\$grant) {
                 \$scopes = (\$grant.Scope -split '\s+') | Where-Object { \$_ -ne '' }
-                if (\$scopes -notcontains \$scope) {
-                    \$scopes += \$scope
+                \$missingScopes = \$requiredScopes | Where-Object { \$scopes -notcontains \$_ }
+                if (\$missingScopes) {
+                    \$scopes += \$missingScopes
                     \$newScope = (\$scopes | Select-Object -Unique) -join ' '
                     Update-MgOauth2PermissionGrant -OAuth2PermissionGrantId \$grant.Id -Scope \$newScope
                     Write-Host \"Updated grant with scope: \$newScope\"
                 } else {
-                    Write-Host \"Scope \$scope already granted.\"
+                    Write-Host \"Required scopes already granted.\"
                 }
             } else {
                 try {
-                    New-MgOauth2PermissionGrant -ClientId \$clientSp.Id -ResourceId \$resSp.Id -ConsentType 'AllPrincipals' -Scope \$scope | Out-Null
-                    Write-Host \"Created new OAuth2PermissionGrant with scope: \$scope\"
+                    \$newScope = \$requiredScopes -join ' '
+                    New-MgOauth2PermissionGrant -ClientId \$clientSp.Id -ResourceId \$resSp.Id -ConsentType 'AllPrincipals' -Scope \$newScope | Out-Null
+                    Write-Host \"Created new OAuth2PermissionGrant with scope: \$newScope\"
                 } catch {
                     Write-Warning \"Failed to create OAuth2PermissionGrant for \${resourceAppId}: \$_\"
                 }

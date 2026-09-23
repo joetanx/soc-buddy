@@ -109,7 +109,7 @@ Deploying SOC Buddy interacts with Azure Subscription resources and Microsoft En
 | Contributor | Azure RBAC / Subscription | Create Azure resources. |
 | User Access Administrator | Azure RBAC / Subscription | Assign `Cognitive Services User` and `AcrPull` roles to the User-Assigned Managed Identity (UAMI). |
 | Cloud Application Administrator / Application Administrator | Entra ID / User | Create service principal; Add Federated Identity Credentials (FIC) to the Agent Blueprint and Teams Bot app registrations. |
-| Privileged Role Administrator | Entra ID / User | Grant tenant-wide Admin Consent for delegated scopes on the Blueprint (`SecurityIncident.ReadWrite.All`, Sentinel MCP scopes). |
+| Privileged Role Administrator | Entra ID / User | Grant tenant-wide Admin Consent for delegated scopes on the Blueprint (`SecurityIncident.ReadWrite.All`, `ThreatHunting.Read.All`, Sentinel MCP scopes). |
 | AI Administrator | Entra ID / User | Publish agent manifest in Microsoft 365 Admin Center. |
 
 ### 1.2. Provision Agent Identity  with a365 CLI
