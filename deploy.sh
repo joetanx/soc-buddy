@@ -3,8 +3,9 @@
 # SOC Buddy - Azure Infrastructure Deployment Script for Azure Cloud Shell
 # ==============================================================================
 # Deploys Azure resources using an ARM template, builds the container image
-# in Azure Container Registry (ACR), configures Managed Identity,
-# sets up Federated Identity Credentials (FIC) for Agent Blueprint & Teams Bot,
+# in Azure Container Registry (ACR), configures Managed Identity, creates the
+# Teams Bot Entra application and Azure Bot resource, sets up Federated Identity
+# Credentials (FIC) for Agent Blueprint & Teams Bot,
 # and grants delegated permissions for Microsoft Sentinel MCPs, Work IQ Mail MCP,
 # and Microsoft Graph Security Incidents and Threat Hunting.
 # ==============================================================================
@@ -79,6 +80,7 @@ register_provider_if_needed "Microsoft.App"
 register_provider_if_needed "Microsoft.OperationalInsights"
 register_provider_if_needed "Microsoft.ContainerRegistry"
 register_provider_if_needed "Microsoft.CognitiveServices"
+register_provider_if_needed "Microsoft.BotService"
 
 # Ensure Sentinel Triage MCP Service Principal exists
 log_step "Verifying required Service Principals..."
@@ -119,9 +121,6 @@ fi
 
 # Check required environment variables
 MISSING_VARS=()
-if [ -z "${TEAMS_BOT_CLIENT_ID:-}" ]; then
-    MISSING_VARS+=("TEAMS_BOT_CLIENT_ID")
-fi
 if [ -z "${APP_NAME:-}" ]; then
     MISSING_VARS+=("APP_NAME")
 fi
@@ -132,7 +131,6 @@ fi
 if [ ${#MISSING_VARS[@]} -ne 0 ]; then
     log_error "Missing required environment variable(s): ${MISSING_VARS[*]}"
     log_error "Please export them before running deploy.sh, for example:"
-    log_error "  export TEAMS_BOT_CLIENT_ID=\"<your-teams-bot-client-id>\""
     log_error "  export APP_NAME=\"<your-app-name>\""
     log_error "  export LOCATION=\"<azure-region>\""
     log_error "  export FOUNDRY_MODEL=\"gpt-5.6-luna\"  # optional, defaults to gpt-5.6-luna"
@@ -141,11 +139,19 @@ fi
 
 RG="rg-${APP_NAME}"
 FOUNDRY_MODEL="${FOUNDRY_MODEL:-gpt-5.6-luna}"
+BOT_NAME="${APP_NAME}-bot"
+BOT_APP_DISPLAY_NAME="${APP_NAME} Teams Bot"
+
+if [[ ! "$BOT_NAME" =~ ^[A-Za-z0-9_-]{4,42}$ ]]; then
+    log_error "The generated Azure Bot name '$BOT_NAME' is invalid."
+    log_error "It must contain 4-42 letters, numbers, underscores, or hyphens."
+    exit 1
+fi
 
 log_info "Application Name:   ${BOLD}${APP_NAME}${NC}"
 log_info "Azure Region:       ${BOLD}${LOCATION}${NC}"
 log_info "Resource Group:     ${BOLD}${RG}${NC}"
-log_info "Teams Bot ID:       ${BOLD}${TEAMS_BOT_CLIENT_ID}${NC}"
+log_info "Azure Bot Name:     ${BOLD}${BOT_NAME}${NC}"
 log_info "Foundry Model:      ${BOLD}${FOUNDRY_MODEL}${NC}"
 
 # Parse a365.generated.config.json
@@ -180,6 +186,56 @@ if ! az group show -n "$RG" &>/dev/null; then
 else
     log_info "Using existing Resource Group '$RG'."
 fi
+
+# Create or reuse the single-tenant Entra application used by Azure Bot.
+# On redeployment, the Azure Bot resource is the authoritative source for the
+# application ID. Before the bot exists, its exact display name is used.
+log_step "Creating Teams Bot identity..."
+
+TEAMS_BOT_CLIENT_ID=$(az bot show \
+    --name "$BOT_NAME" \
+    --resource-group "$RG" \
+    --query "properties.msaAppId" \
+    -o tsv 2>/dev/null || true)
+
+if [ -n "$TEAMS_BOT_CLIENT_ID" ]; then
+    if ! az ad app show --id "$TEAMS_BOT_CLIENT_ID" &>/dev/null; then
+        log_error "Azure Bot '$BOT_NAME' references Entra application '$TEAMS_BOT_CLIENT_ID', but that application cannot be found."
+        exit 1
+    fi
+    log_info "Using the Entra application associated with Azure Bot '$BOT_NAME'."
+else
+    mapfile -t EXISTING_BOT_APP_IDS < <(
+        az ad app list \
+            --display-name "$BOT_APP_DISPLAY_NAME" \
+            --query "[].appId" \
+            -o tsv
+    )
+
+    if [ ${#EXISTING_BOT_APP_IDS[@]} -gt 1 ]; then
+        log_error "Multiple Entra applications are named '$BOT_APP_DISPLAY_NAME'."
+        log_error "Remove or rename the duplicates, then rerun deploy.sh."
+        exit 1
+    elif [ ${#EXISTING_BOT_APP_IDS[@]} -eq 1 ]; then
+        TEAMS_BOT_CLIENT_ID="${EXISTING_BOT_APP_IDS[0]}"
+        log_info "Reusing Entra application '$BOT_APP_DISPLAY_NAME'."
+    else
+        log_info "Creating single-tenant Entra application '$BOT_APP_DISPLAY_NAME'..."
+        TEAMS_BOT_CLIENT_ID=$(az ad app create \
+            --display-name "$BOT_APP_DISPLAY_NAME" \
+            --sign-in-audience "AzureADMyOrg" \
+            --query "appId" \
+            -o tsv)
+        log_success "Created Teams Bot Entra application."
+    fi
+fi
+
+if ! az ad sp show --id "$TEAMS_BOT_CLIENT_ID" &>/dev/null; then
+    log_info "Creating Service Principal for Teams Bot application..."
+    az ad sp create --id "$TEAMS_BOT_CLIENT_ID" --output none
+fi
+
+log_info "Teams Bot Client ID: ${BOLD}${TEAMS_BOT_CLIENT_ID}${NC}"
 
 # Query model version dynamically for the requested model in the given location
 log_info "Resolving model version for '${FOUNDRY_MODEL}' in '${LOCATION}'..."
@@ -234,7 +290,62 @@ log_info "Messaging Endpoint:  ${BOLD}${MESSAGING_ENDPOINT}${NC}"
 log_info "OAuth Redirect URI:  ${BOLD}${OAUTH_REDIRECT_URI}${NC}"
 
 # ------------------------------------------------------------------------------
-# 4. Build Container Image in ACR & Update Container App
+# 4. Create Azure Bot Resource and Enable the Teams Channel
+# ------------------------------------------------------------------------------
+log_step "Creating Azure Bot resource..."
+
+EXISTING_AZURE_BOT_APP_ID=$(az bot show \
+    --name "$BOT_NAME" \
+    --resource-group "$RG" \
+    --query "properties.msaAppId" \
+    -o tsv 2>/dev/null || true)
+
+if [ -n "$EXISTING_AZURE_BOT_APP_ID" ]; then
+    if [ "$EXISTING_AZURE_BOT_APP_ID" != "$TEAMS_BOT_CLIENT_ID" ]; then
+        log_error "Azure Bot '$BOT_NAME' is associated with application '$EXISTING_AZURE_BOT_APP_ID'."
+        log_error "The deployment resolved Teams Bot application '$TEAMS_BOT_CLIENT_ID'."
+        log_error "Refusing to overwrite a bot associated with a different identity."
+        exit 1
+    fi
+
+    log_info "Updating Azure Bot messaging endpoint..."
+    az bot update \
+        --name "$BOT_NAME" \
+        --resource-group "$RG" \
+        --endpoint "$MESSAGING_ENDPOINT" \
+        --output none
+else
+    log_info "Creating single-tenant Azure Bot '$BOT_NAME'..."
+    az bot create \
+        --name "$BOT_NAME" \
+        --resource-group "$RG" \
+        --location "global" \
+        --sku "F0" \
+        --app-type "SingleTenant" \
+        --appid "$TEAMS_BOT_CLIENT_ID" \
+        --tenant-id "$TENANT_ID" \
+        --endpoint "$MESSAGING_ENDPOINT" \
+        --display-name "$APP_NAME" \
+        --description "Microsoft Teams bot for SOC Buddy" \
+        --output none
+fi
+
+if az bot msteams show \
+    --name "$BOT_NAME" \
+    --resource-group "$RG" &>/dev/null; then
+    log_info "Microsoft Teams channel is already enabled."
+else
+    log_info "Enabling the Microsoft Teams channel..."
+    az bot msteams create \
+        --name "$BOT_NAME" \
+        --resource-group "$RG" \
+        --output none
+fi
+
+log_success "Azure Bot is configured with endpoint '$MESSAGING_ENDPOINT'."
+
+# ------------------------------------------------------------------------------
+# 5. Build Container Image in ACR & Update Container App
 # ------------------------------------------------------------------------------
 log_step "Building container image in ACR ($ACR_NAME)..."
 log_info "Running 'az acr build' from context: $SCRIPT_DIR"
@@ -246,7 +357,7 @@ az containerapp update -n "$APP_NAME" -g "$RG" \
 log_success "Container App updated with '${APP_NAME}:latest'."
 
 # ------------------------------------------------------------------------------
-# 5. Setup Federated Identity Credentials (FIC)
+# 6. Setup Federated Identity Credentials (FIC)
 # ------------------------------------------------------------------------------
 log_step "Configuring Federated Identity Credentials (FIC) for Blueprint & Teams Bot..."
 
@@ -270,59 +381,89 @@ else
     log_info "FIC '$FIC_NAME' already configured on Agent Blueprint."
 fi
 
-# Configure FIC, Web Redirect URI, and Blueprint API permission on Teams Bot App if Client ID is available
-if [ -n "$TEAMS_BOT_CLIENT_ID" ]; then
-    log_info "Configuring Teams Bot application ($TEAMS_BOT_CLIENT_ID)..."
+# Configure FIC, Web Redirect URI, and Blueprint API permission on Teams Bot App
+log_info "Configuring Teams Bot application ($TEAMS_BOT_CLIENT_ID)..."
 
-    # 1. Federated Identity Credential
-    EXISTING_TB_FIC=$(az ad app federated-credential list --id "$TEAMS_BOT_CLIENT_ID" \
-        --query "[?name=='${FIC_NAME}'].name" -o tsv 2>/dev/null || true)
-    if [ -z "$EXISTING_TB_FIC" ]; then
-        az ad app federated-credential create --id "$TEAMS_BOT_CLIENT_ID" \
-            --parameters "{
-                \"name\": \"${FIC_NAME}\",
-                \"issuer\": \"https://login.microsoftonline.com/${TENANT_ID}/v2.0\",
-                \"subject\": \"${UAMI_ID}\",
-                \"audiences\": [\"api://AzureADTokenExchange\"]
-            }" --output none 2>/dev/null || log_warn "Could not add FIC to Teams Bot App. Ensure you have permissions or configure manually."
-        log_success "FIC added to Teams Bot App."
-    else
-        log_info "FIC '$FIC_NAME' already configured on Teams Bot App."
-    fi
-
-    # 2. Configure Web Redirect URI
-    log_info "Configuring Web Redirect URI on Teams Bot application ($TEAMS_BOT_CLIENT_ID)..."
-    python3 -c "
-import subprocess, json
-
-bot_id = '${TEAMS_BOT_CLIENT_ID}'
-redirect_uri = '${OAUTH_REDIRECT_URI}'
-
-try:
-    raw = subprocess.check_output(['az', 'ad', 'app', 'show', '--id', bot_id, '--query', 'web.redirectUris', '-o', 'json']).decode('utf-8').strip()
-    uris = json.loads(raw) if raw and raw != 'null' else []
-except Exception:
-    uris = []
-
-if redirect_uri not in uris:
-    uris.append(redirect_uri)
-    subprocess.call(['az', 'ad', 'app', 'update', '--id', bot_id, '--web-redirect-uris'] + uris)
-" 2>/dev/null || az ad app update --id "$TEAMS_BOT_CLIENT_ID" --web-redirect-uris "$OAUTH_REDIRECT_URI" --output none 2>/dev/null || log_warn "Could not update redirect URI on Teams Bot App."
-    log_success "Web Redirect URI set to: $OAUTH_REDIRECT_URI"
-
-    # 3. Grant Agent Blueprint access permission ('access_agent_as_user')
-    log_info "Granting Agent Blueprint access permission ('access_agent_as_user') to Teams Bot..."
-    SCOPE_ID=$(az ad app show --id "$BLUEPRINT_CLIENT_ID" --query "api.oauth2PermissionScopes[?value=='access_agent_as_user'].id | [0]" -o tsv 2>/dev/null || true)
-    if [ -n "$SCOPE_ID" ]; then
-        az ad app permission add --id "$TEAMS_BOT_CLIENT_ID" --api "$BLUEPRINT_CLIENT_ID" --api-permissions "${SCOPE_ID}=Scope" 2>/dev/null || true
-    else
-        az ad app permission add --id "$TEAMS_BOT_CLIENT_ID" --api "$BLUEPRINT_CLIENT_ID" --api-permissions "access_agent_as_user=Scope" 2>/dev/null || true
-    fi
-    log_success "Blueprint access permission ('access_agent_as_user') configured on Teams Bot."
+# 1. Federated Identity Credential
+EXISTING_TB_FIC=$(az ad app federated-credential list --id "$TEAMS_BOT_CLIENT_ID" \
+    --query "[?name=='${FIC_NAME}'].name" -o tsv 2>/dev/null || true)
+if [ -z "$EXISTING_TB_FIC" ]; then
+    az ad app federated-credential create --id "$TEAMS_BOT_CLIENT_ID" \
+        --parameters "{
+            \"name\": \"${FIC_NAME}\",
+            \"issuer\": \"https://login.microsoftonline.com/${TENANT_ID}/v2.0\",
+            \"subject\": \"${UAMI_ID}\",
+            \"audiences\": [\"api://AzureADTokenExchange\"]
+        }" --output none
+    log_success "FIC added to Teams Bot App."
+else
+    log_info "FIC '$FIC_NAME' already configured on Teams Bot App."
 fi
 
+# 2. Configure Web Redirect URI
+log_info "Configuring Web Redirect URI on Teams Bot application ($TEAMS_BOT_CLIENT_ID)..."
+mapfile -t CURRENT_REDIRECT_URIS < <(
+    az ad app show \
+        --id "$TEAMS_BOT_CLIENT_ID" \
+        --query "web.redirectUris[]" \
+        -o tsv
+)
+
+REDIRECT_URI_EXISTS=false
+for redirect_uri in "${CURRENT_REDIRECT_URIS[@]}"; do
+    if [ "$redirect_uri" = "$OAUTH_REDIRECT_URI" ]; then
+        REDIRECT_URI_EXISTS=true
+        break
+    fi
+done
+
+if [ "$REDIRECT_URI_EXISTS" = false ]; then
+    CURRENT_REDIRECT_URIS+=("$OAUTH_REDIRECT_URI")
+    az ad app update \
+        --id "$TEAMS_BOT_CLIENT_ID" \
+        --web-redirect-uris "${CURRENT_REDIRECT_URIS[@]}" \
+        --output none
+fi
+log_success "Web Redirect URI set to: $OAUTH_REDIRECT_URI"
+
+# 3. Grant Agent Blueprint access permission ('access_agent_as_user')
+log_info "Granting Agent Blueprint access permission ('access_agent_as_user') to Teams Bot..."
+SCOPE_ID=$(az ad app show \
+    --id "$BLUEPRINT_CLIENT_ID" \
+    --query "api.oauth2PermissionScopes[?value=='access_agent_as_user'].id | [0]" \
+    -o tsv)
+
+if [ -z "$SCOPE_ID" ]; then
+    log_error "Scope 'access_agent_as_user' was not found on Blueprint application '$BLUEPRINT_CLIENT_ID'."
+    exit 1
+fi
+
+BOT_REQUIRED_RESOURCE_ACCESS=$(az ad app show \
+    --id "$TEAMS_BOT_CLIENT_ID" \
+    --query "requiredResourceAccess" \
+    -o json)
+
+if ! python3 -c '
+import json, sys
+
+resource_app_id, scope_id = sys.argv[1:3]
+permissions = json.load(sys.stdin)
+found = any(
+    item.get("resourceAppId") == resource_app_id
+    and any(access.get("id") == scope_id for access in item.get("resourceAccess", []))
+    for item in permissions
+)
+raise SystemExit(0 if found else 1)
+' "$BLUEPRINT_CLIENT_ID" "$SCOPE_ID" <<< "$BOT_REQUIRED_RESOURCE_ACCESS"; then
+    az ad app permission add \
+        --id "$TEAMS_BOT_CLIENT_ID" \
+        --api "$BLUEPRINT_CLIENT_ID" \
+        --api-permissions "${SCOPE_ID}=Scope"
+fi
+log_success "Blueprint access permission ('access_agent_as_user') configured on Teams Bot."
+
 # ------------------------------------------------------------------------------
-# 6. Configure Inheritable and Required API Permissions & Grant Admin Consent
+# 7. Configure Inheritable and Required API Permissions & Grant Admin Consent
 # ------------------------------------------------------------------------------
 log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 
@@ -330,20 +471,22 @@ log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 # 1. Sentinel MCP Data Exploration: App 4500ebfb-89b6-4b14-a480-7f749797bfcd, SPN eaff9684-612c-4add-aa10-035fd3bfe3d1, DelegatedRoleId 991a963a-4203-4dbc-acf2-254a258f76f2, Scope SentinelPlatform.DelegatedAccess
 # 2. Sentinel MCP Triage:           App 7b7b3966-1961-47b5-b080-43ca5482e21c, SPN 8dd500d0-c3aa-4380-96d1-09b4b6233eff, DelegatedRoleId 69b8d760-4df6-4017-a3e6-1a8049cbce42, Scope MCP.Read.All
 # 3. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, SPN 93aac09f-5f9b-4b4c-aa45-c623a1b69342, DelegatedRoleId fa91a9e8-6808-4167-a950-8f1fe525b270, Scope Tools.ListInvoke.All
-# 4. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId 128ca929-1a19-45e6-a3b8-435ec44a36ba, Scope SecurityIncident.ReadWrite.All
+# 4. Azure Tools:                   App 797f4846-ba00-4fd7-ba43-dac1f8f63013, SPN 71e36942-1dcc-468d-bb7f-6ca533a87559, DelegatedRoleId 41094075-9dad-400e-a0bd-54e686782033, Scope user_impersonation
+# 5. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId 128ca929-1a19-45e6-a3b8-435ec44a36ba, Scope SecurityIncident.ReadWrite.All
 #                                   App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId b152eca8-ea73-4a48-8c98-1a6742673d99, Scope ThreatHunting.Read.All
 
-# Step 6A: Allow agent identities created from the Blueprint to inherit Sentinel MCP permissions
+# Step 7A: Allow agent identities created from the Blueprint to inherit delegated permissions
 BLUEPRINT_OBJECT_ID=$(az ad app show --id "$BLUEPRINT_CLIENT_ID" --query id -o tsv)
 INHERITABLE_PERMISSIONS_ENDPOINT="https://graph.microsoft.com/v1.0/applications/${BLUEPRINT_OBJECT_ID}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions"
 INHERITABLE_PERMISSIONS=$(az rest --method get --url "$INHERITABLE_PERMISSIONS_ENDPOINT" --output json)
 # This section only handles Sentinel MCP inheritable permissions as Graph and Work IQ are covered by a365 CLI
-SENTINEL_MCP_RESOURCE_IDS=(
+PERMISSION_RESOURCE_IDS=(
     "4500ebfb-89b6-4b14-a480-7f749797bfcd"
     "7b7b3966-1961-47b5-b080-43ca5482e21c"
+    "797f4846-ba00-4fd7-ba43-dac1f8f63013"
 )
 
-for resource_app_id in "${SENTINEL_MCP_RESOURCE_IDS[@]}"; do
+for resource_app_id in "${PERMISSION_RESOURCE_IDS[@]}"; do
     if python3 -c '
 import json, sys
 permissions = json.load(sys.stdin).get("value", [])
@@ -369,7 +512,7 @@ print(json.dumps({
 done
 log_success "Sentinel MCP inheritable permissions configured on Blueprint."
 
-# Step 6B: Update Blueprint App Registration requiredResourceAccess
+# Step 7B: Update Blueprint App Registration requiredResourceAccess
 python3 -c "
 import subprocess, json
 
@@ -389,6 +532,10 @@ target_permissions = [
     {
         'resourceAppId': '16b1878d-62c7-4009-aa25-68989d63bbad',
         'resourceAccess': [{'id': 'fa91a9e8-6808-4167-a950-8f1fe525b270', 'type': 'Scope'}]
+    },
+    {
+        'resourceAppId': '797f4846-ba00-4fd7-ba43-dac1f8f63013',
+        'resourceAccess': [{'id': '41094075-9dad-400e-a0bd-54e686782033', 'type': 'Scope'}]
     },
     {
         'resourceAppId': '00000003-0000-0000-c000-000000000000',
@@ -420,11 +567,11 @@ log_info "Updating requiredResourceAccess on Blueprint App..."
 az ad app update --id "$BLUEPRINT_CLIENT_ID" --required-resource-accesses @/tmp/soc_buddy_merged_rra.json
 rm -f /tmp/soc_buddy_merged_rra.json
 
-# Step 6C: Attempt admin consent via az cli
+# Step 7C: Attempt admin consent via az cli
 log_info "Attempting admin consent on Blueprint Application..."
 az ad app permission admin-consent --id "$BLUEPRINT_CLIENT_ID" 2>/dev/null || log_info "az ad app permission admin-consent completed or requires elevated admin."
 
-# Step 6D: Use PowerShell Microsoft Graph module to ensure Service Principals and OAuth2PermissionGrants exist
+# Step 7D: Use PowerShell Microsoft Graph module to ensure Service Principals and OAuth2PermissionGrants exist
 log_info "Executing PowerShell Graph commands to ensure tenant-wide delegated grants..."
 pwsh -NoProfile -Command "
     \$ErrorActionPreference = 'Continue'
@@ -494,7 +641,7 @@ pwsh -NoProfile -Command "
 log_success "Permissions granted and verified."
 
 # ------------------------------------------------------------------------------
-# 7. Completion & Next Steps Summary
+# 8. Completion & Next Steps Summary
 # ------------------------------------------------------------------------------
 log_step "Deployment Complete!"
 
@@ -504,6 +651,7 @@ echo -e "${GREEN}${BOLD}========================================================
 echo -e "Application Name:       ${BOLD}${APP_NAME}${NC}"
 echo -e "Resource Group:         ${BOLD}${RG}${NC}"
 echo -e "Location:               ${BOLD}${LOCATION}${NC}"
+echo -e "Azure Bot Name:         ${BOLD}${BOT_NAME}${NC}"
 echo -e "Messaging Endpoint:     ${CYAN}${BOLD}${MESSAGING_ENDPOINT}${NC}"
 echo -e "OAuth Redirect URI:     ${CYAN}${BOLD}${OAUTH_REDIRECT_URI}${NC}"
 echo -e "Blueprint Client ID:    ${BOLD}${BLUEPRINT_CLIENT_ID}${NC}"
@@ -512,20 +660,15 @@ echo -e "UAMI Principal ID:      ${BOLD}${UAMI_ID}${NC}"
 echo -e "ACR Name:               ${BOLD}${ACR_NAME}${NC}"
 echo -e "AI Foundry Endpoint:    ${BOLD}${FOUNDRY_PROJECT_ENDPOINT}${NC}"
 echo -e "========================================================================"
-echo -e "${YELLOW}${BOLD}CRITICAL POST-DEPLOYMENT ACTIONS REQUIRED:${NC}"
-if [ -n "$TEAMS_BOT_CLIENT_ID" ]; then
-    echo -e "1. ${GREEN}${BOLD}Teams Bot App Web Redirect URI & Permissions:${NC} ${BOLD}Configured automatically.${NC}"
-    echo -e "   - Web Redirect URI set to: ${CYAN}${OAUTH_REDIRECT_URI}${NC}"
-    echo -e "   - Blueprint access permission ('access_agent_as_user') added to Bot App (${TEAMS_BOT_CLIENT_ID})."
-else
-    echo -e "1. ${BOLD}Configure Teams Bot App in Microsoft Entra Admin Center:${NC}"
-    echo -e "   - Open Entra ID > App Registrations > Select your Teams Bot App"
-    echo -e "   - 'Authentication' > Add Web Redirect URI: ${CYAN}${OAUTH_REDIRECT_URI}${NC}"
-    echo -e "   - 'API permissions' > Add Agent Blueprint (${BLUEPRINT_CLIENT_ID}) > 'access_agent_as_user'"
-fi
-echo -e "2. ${BOLD}Configure Messaging Endpoint in Azure Bot Service / Bot Framework:${NC}"
-echo -e "   - Messaging Endpoint URL: ${CYAN}${MESSAGING_ENDPOINT}${NC}"
-echo -e "3. ${BOLD}Publish / Activate Agent Manifest in Microsoft 365 Admin Center:${NC}"
+echo -e "${GREEN}${BOLD}AUTOMATICALLY CONFIGURED:${NC}"
+echo -e "1. Azure Bot resource '${BOT_NAME}' created or updated."
+echo -e "2. Microsoft Teams channel enabled."
+echo -e "3. Messaging endpoint set to: ${CYAN}${MESSAGING_ENDPOINT}${NC}"
+echo -e "4. OAuth redirect URI set to: ${CYAN}${OAUTH_REDIRECT_URI}${NC}"
+echo -e "5. Blueprint access permission added to Bot App (${TEAMS_BOT_CLIENT_ID})."
+echo -e "========================================================================"
+echo -e "${YELLOW}${BOLD}POST-DEPLOYMENT ACTION REQUIRED:${NC}"
+echo -e "1. ${BOLD}Publish / Activate Agent Manifest in Microsoft 365 Admin Center:${NC}"
 echo -e "   - Run 'a365 publish' to produce manifest.zip"
 echo -e "   - Upload in M365 Admin Center (Settings > Integrated apps / Agents)"
 echo -e "========================================================================"

@@ -61,6 +61,11 @@ from msgraph.generated.models.security.incident_status import IncidentStatus
 from msgraph.generated.models.security.alert_classification import AlertClassification
 from msgraph.generated.models.security.alert_determination import AlertDetermination
 
+# Azure SDK imports
+from azure.mgmt.loganalytics import LogAnalyticsManagementClient
+from azure.mgmt.resourcegraph import ResourceGraphClient
+from azure.mgmt.resourcegraph.models import QueryRequest
+
 # Initialize logging
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 
@@ -258,9 +263,63 @@ def get_thread_id(context: TurnContext) -> str:
     return str(sender_id or getattr(activity, "id", "default"))
 
 
-# Microsoft Graph Security API tools.
+# Token wrapper for synchronous Azure management SDK clients.
+class AzureAccessTokenProvider:
+    def __init__(self, token: str):
+        self.token = token
+
+    def get_token(self, *scopes, **kwargs) -> AccessToken:
+        return AccessToken(self.token, expires_on=int( (datetime.now().astimezone() + timedelta(hours=1)).timestamp()))
+
+
+# Construct tools that wrap Azure Resource Manager API calls.
+async def get_azure_tools(user_id: str) -> list[BaseTool]:
+    azure_token = await get_obo_token(user_id, ["https://management.azure.com/.default"])
+
+    @tool
+    async def list_workspaces() -> str:
+        """List Microsoft Sentinel-enabled Log Analytics workspaces accessible to the current user."""
+        query = """
+        resources
+        | where type =~ "microsoft.operationsmanagement/solutions" and name contains "SecurityInsights"
+        | project workspaceName = extract(@"^SecurityInsights\\((.+)\\)$", 1, name)
+        | join kind=inner (
+            resources
+            | where type =~ "microsoft.operationalinsights/workspaces"
+        ) on $left.workspaceName == $right.name
+        | project subscriptionId, resourceGroup, name, workspaceId = properties.customerId
+        """.strip()
+        resource_graph_client = ResourceGraphClient(
+            credential=AzureAccessTokenProvider(azure_token)
+        )
+        response = resource_graph_client.resources(QueryRequest(query=query))
+        return json.dumps(response.data, default=str)
+
+    @tool
+    async def list_tables_in_workspace(
+        subscription_id: Annotated[str, Field(description="Azure subscription ID returned by list_workspaces")],
+        resource_group_name: Annotated[str, Field(description="Resource group containing the workspace")],
+        workspace_name: Annotated[str, Field(description="Log Analytics workspace name")],
+    ) -> str:
+        """List the names of all tables in a Log Analytics workspace."""
+        log_analytics_client = LogAnalyticsManagementClient(
+            credential=AzureAccessTokenProvider(azure_token),
+            subscription_id=subscription_id,
+        )
+        tables = log_analytics_client.tables.list_by_workspace(
+            resource_group_name=resource_group_name,
+            workspace_name=workspace_name,
+        )
+        return json.dumps([table.name for table in tables])
+
+    return [
+        list_workspaces,
+        list_tables_in_workspace,
+    ]
+
+
+# Token wrapper for Microsoft Graph SDK.
 class GraphAccessTokenProvider:
-    # Token provider for Microsoft Graph SDK.
     def __init__(self, token: str):
         self.token = token
 
@@ -269,14 +328,7 @@ class GraphAccessTokenProvider:
         # Provide token string and an arbitrary future expiration timestamp (in seconds)
         return AccessToken(self.token, expires_on=int((datetime.now().astimezone() + timedelta(hours=1)).timestamp()))
 
-async def get_graph_client(user_id: str) -> GraphServiceClient:
-    """Get a token for Microsoft Graph API using MSAL, and return a GraphServiceClient instance."""
-
-    graph_token = await get_obo_token(user_id, ["https://graph.microsoft.com/.default"])
-    return GraphServiceClient(
-        GraphAccessTokenProvider(graph_token)
-    )
-
+# Helper functions for JSON serialization and KQL query construction.
 def _response_json(value: Parsable | list[Parsable]) -> str:
     writer = JsonSerializationWriter()
     writer.write_any_value(None, value)
@@ -303,13 +355,17 @@ def _kql_search_regex(values: list[str], entity_type: str) -> str:
     escaped_values = "|".join(re.escape(value) for value in _kql_values(values, entity_type))
     return json.dumps(f"(?i)(?:{escaped_values})")
 
+# Construct tools that wrap Microsoft Graph API calls for use with LangChain.
 async def get_graph_tools(user_id: str) -> list[BaseTool]:
     
-    graph_client = await get_graph_client(user_id)
+    graph_token = await get_obo_token(user_id, ["https://graph.microsoft.com/.default"])
+    graph_client = GraphServiceClient(
+        GraphAccessTokenProvider(graph_token)
+    )
 
     @tool
     async def get_incident_with_alerts(
-        incident_id: Annotated[str, Field(description='Incident ID')]
+        incident_id: Annotated[str, Field(description="Incident ID")]
     ) -> str:
         """Get one Microsoft security incident and its associated alerts."""
         attempts = int(environ.get("INCIDENT_FETCH_ATTEMPTS", "5"))
@@ -338,122 +394,115 @@ async def get_graph_tools(user_id: str) -> list[BaseTool]:
 
     async def _run_hunting_query(
         query: str,
-        timespan: Optional[str] = 'P7D',
+        timespan: Optional[str] = None,
         workspace_id: Optional[str] = None,
     ) -> str:
-        request_body = RunHuntingQueryPostRequestBody(query=query, timespan=timespan)
+        request_body = RunHuntingQueryPostRequestBody(query=query)
+        if timespan is not None:
+            request_body.additional_data["timespan"] = timespan
         if workspace_id is not None:
             request_body.additional_data["workspaceId"] = workspace_id
         response = await graph_client.security.microsoft_graph_security_run_hunting_query.post(request_body)
         return _response_json(response.results)
 
     @tool
-    async def run_hunting_query(
-        query: Annotated[str, Field(description='Custom KQL threat-hunting query. Use the dedicated blast-radius tools instead when searching incident user, host, or IP address entities.')],
-        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P7D',
-        workspace_id: Annotated[Optional[str], Field(description='Log Analytics workspace GUID')] = None,
+    async def get_table_schema(
+        table_name: Annotated[str, Field(description="Log Analytics table name")],
+        workspace_id: Annotated[Optional[str], Field(description="Log Analytics workspace GUID, defaults to primary workspace.")] = None,
     ) -> str:
-        """Run custom KQL that is not covered by a dedicated hunting tool."""
-        return await _run_hunting_query(
-            query=query,
-            timespan=timespan,
-            workspace_id=workspace_id,
-        )
+        """Get a Log Analytics table schema by running the KQL getschema operator."""
+        return await _run_hunting_query(query=f"{table_name} | getschema", timespan=None, workspace_id=workspace_id)
+
+    @tool
+    async def run_hunting_query(
+        query: Annotated[str, Field(description="Custom KQL threat-hunting query. Use the dedicated blast-radius tools instead when searching incident user, host, or IP address entities.")],
+        timespan: Annotated[Optional[str], Field(description="ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`, defaults to `P7D`.")] = "P7D",
+        workspace_id: Annotated[Optional[str], Field(description="Log Analytics workspace GUID, defaults to primary workspace.")] = None,
+    ) -> str:
+        """Run custom KQL not covered by a dedicated search tool."""
+        return await _run_hunting_query(query=query, timespan=timespan, workspace_id=workspace_id)
 
     @tool
     async def search_threat_intelligence(
-        indicators: Annotated[list[str], Field(description='List of indicator observables (IP addresses, domain names, URLs, hashes) to check against Microsoft Threat Intelligence.')],
-        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P7D',
+        indicators: Annotated[list[str], Field(description="List of indicator observables (IP addresses, domain names, URLs, hashes) to check against Microsoft Threat Intelligence.")],
+        timespan: Annotated[Optional[str], Field(description="ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`, defaults to `P7D`.")] = "P7D",
+        workspace_id: Annotated[Optional[str], Field(description="Log Analytics workspace GUID, defaults to primary workspace.")] = None,
     ) -> str:
-        """Tool that abstracts KQL against ThreatIntelIndicators to check Microsoft Threat Intelligence for indicators matches."""
+        """Search ThreatIntelIndicators table for indicators matches."""
         query = (
             "ThreatIntelIndicators\n"
             f"| where ObservableValue in~ ({_kql_string_list(indicators, 'indicator')})\n"
-            "| project Modified, ObservableKey, ObservableValue, IsActive, Confidence\n"
+            "| project Modified, SourceSystem, ObservableKey, ObservableValue, IsActive, Confidence\n"
             "| summarize arg_max(Modified, *) by ObservableValue"
         )
-        return await _run_hunting_query(query=query, timespan=timespan)
+        return await _run_hunting_query(query=query, timespan=timespan, workspace_id=workspace_id)
 
     @tool
-    async def hunt_user_blast_radius(
-        users: Annotated[list[str], Field(description='User names, account names, or identities observed in an incident')],
-        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P3D',
-        workspace_id: Annotated[Optional[str], Field(description='Log Analytics workspace GUID')] = None,
+    async def search_user_blast_radius(
+        users: Annotated[list[str], Field(description="User names, account names, or identities observed in an incident")],
+        timespan: Annotated[Optional[str], Field(description="ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`, defaults to `P3D`.")] = "P3D",
+        workspace_id: Annotated[Optional[str], Field(description="Log Analytics workspace GUID, defaults to primary workspace.")] = None,
     ) -> str:
-        """Find occurrences of incident user entities across sign-in, Windows security, and Syslog events."""
+        """Search SigninLogs, SecurityEvents and Syslog tables for occurrences of user entities in Entra, Windows and Linux events."""
         search_users = _kql_search_regex(users, "user")
         query = (
             "union withsource=SourceTable\n"
             "    (SigninLogs\n"
-            f"    | where Identity matches regex {search_users}\n"
-            "    | project-rename SourceIp = IPAddress),\n"
+            f"    | where Identity matches regex {search_users}),\n"
             "    (SecurityEvent\n"
             f"    | where Account matches regex {search_users}\n"
-            "    | project-rename SourceIp = IpAddress),\n"
+            "    | project-rename IPAddress = IpAddress),\n"
             "    (Syslog\n"
             f"    | where SyslogMessage matches regex {search_users})\n"
             "| order by TimeGenerated desc"
         )
-        return await _run_hunting_query(
-            query=query,
-            timespan=timespan,
-            workspace_id=workspace_id,
-        )
+        return await _run_hunting_query(query=query, timespan=timespan, workspace_id=workspace_id)
 
     @tool
-    async def hunt_host_blast_radius(
-        hosts: Annotated[list[str], Field(description='Host or computer names observed in an incident')],
-        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P3D',
-        workspace_id: Annotated[Optional[str], Field(description='Log Analytics workspace GUID')] = None,
+    async def search_host_blast_radius(
+        hosts: Annotated[list[str], Field(description="Host or computer names observed in an incident")],
+        timespan: Annotated[Optional[str], Field(description="ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`, defaults to `P3D`.")] = "P3D",
+        workspace_id: Annotated[Optional[str], Field(description="Log Analytics workspace GUID, defaults to primary workspace.")] = None,
     ) -> str:
-        """Find occurrences of incident host entities across Windows security and Syslog events."""
+        """Search SecurityEvents and Syslog tables for occurrences of host entities in Windows and Linux events."""
         search_hosts = _kql_search_regex(hosts, "host")
         query = (
             "union withsource=SourceTable\n"
             "    (SecurityEvent\n"
             f"    | where Computer matches regex {search_hosts}\n"
-            "    | project-rename SourceIp = IpAddress),\n"
+            "    | project-rename IPAddress = IpAddress),\n"
             "    (Syslog\n"
             f"    | where HostName matches regex {search_hosts})\n"
             "| order by TimeGenerated desc"
         )
-        return await _run_hunting_query(
-            query=query,
-            timespan=timespan,
-            workspace_id=workspace_id,
-        )
+        return await _run_hunting_query(query=query, timespan=timespan, workspace_id=workspace_id)
 
     @tool
-    async def hunt_ip_blast_radius(
-        ip_addresses: Annotated[list[str], Field(description='IP addresses observed in an incident')],
-        timespan: Annotated[Optional[str], Field(description='ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`')] = 'P3D',
-        workspace_id: Annotated[Optional[str], Field(description='Log Analytics workspace GUID')] = None,
+    async def search_ip_blast_radius(
+        ip_addresses: Annotated[list[str], Field(description="IP addresses observed in an incident")],
+        timespan: Annotated[Optional[str], Field(description="ISO 8601 duration in format `P[n]Y[n]M[n]DT[n]H[n]M[n]S`, defaults to `P3D`.")] = "P3D",
+        workspace_id: Annotated[Optional[str], Field(description="Log Analytics workspace GUID, defaults to primary workspace.")] = None,
     ) -> str:
-        """Find occurrences of incident IP address entities across sign-in, Windows security, and Syslog events."""
+        """Search SigninLogs, SecurityEvents and Syslog tables for occurrences of IP address entities in Entra, Windows and Linux events."""
         search_ip_list = _kql_string_list(ip_addresses, "IP address")
         search_ip_regex = _kql_search_regex(ip_addresses, "IP address")
         query = (
             "union withsource=SourceTable\n"
             "    (SigninLogs\n"
-            f"    | where IPAddress in~ ({search_ip_list})\n"
-            "    | project-rename SourceIp = IPAddress),\n"
+            f"    | where IPAddress in~ ({search_ip_list})),\n"
             "    (SecurityEvent\n"
             f"    | where IpAddress in~ ({search_ip_list})\n"
-            "    | project-rename SourceIp = IpAddress),\n"
+            "    | project-rename IPAddress = IpAddress),\n"
             "    (Syslog\n"
             f"    | where SyslogMessage matches regex {search_ip_regex})\n"
             "| order by TimeGenerated desc"
         )
-        return await _run_hunting_query(
-            query=query,
-            timespan=timespan,
-            workspace_id=workspace_id,
-        )
+        return await _run_hunting_query(query=query, timespan=timespan, workspace_id=workspace_id)
 
     @tool
     async def add_incident_comment(
-        incident_id: Annotated[str, Field(description='Incident ID')],
-        comment: Annotated[str, Field(description='Comment to be added')]
+        incident_id: Annotated[str, Field(description="Incident ID")],
+        comment: Annotated[str, Field(description="Comment to be added")]
     ) -> str:
         """Add a comment to a Microsoft security incident."""
         request_body = AlertComment(odata_type=None, comment=comment)
@@ -463,13 +512,13 @@ async def get_graph_tools(user_id: str) -> list[BaseTool]:
 
     @tool
     async def update_incident(
-        incident_id: Annotated[str, Field(description='Incident ID')],
-        status: Annotated[Optional[str], Field(description='Incident status; options: active, inProgress, resolved, redirected')] = None,
-        assigned_to: Annotated[Optional[str], Field(description='User/group to be assigned to')] = None,
-        classification: Annotated[Optional[str], Field(description='Classification of the incident; options: falsePositive, truePositive, informationalExpectedActivity')] = None,
-        determination: Annotated[Optional[str], Field(description='Details to incident classification; options: unknown, apt, malware, securityPersonnel, securityTesting, unwantedSoftware, other, multiStagedAttack, compromisedAccount, phishing, maliciousUserActivity, notMalicious, notEnoughDataToValidate, confirmedUserActivity, lineOfBusinessApplication')] = None,
-        custom_tags: Annotated[Optional[list[str]], Field(description='Custom tags for the incident')] = None,
-        resolving_comment: Annotated[Optional[str], Field(description='Comment to explain the resolution of the incident and the classification choice')] = None,
+        incident_id: Annotated[str, Field(description="Incident ID")],
+        status: Annotated[Optional[str], Field(description="Incident status; options: active, inProgress, resolved, redirected")] = None,
+        assigned_to: Annotated[Optional[str], Field(description="User/group to be assigned to")] = None,
+        classification: Annotated[Optional[str], Field(description="Classification of the incident; options: falsePositive, truePositive, informationalExpectedActivity")] = None,
+        determination: Annotated[Optional[str], Field(description="Details to incident classification; options: unknown, apt, malware, securityPersonnel, securityTesting, unwantedSoftware, other, multiStagedAttack, compromisedAccount, phishing, maliciousUserActivity, notMalicious, notEnoughDataToValidate, confirmedUserActivity, lineOfBusinessApplication")] = None,
+        custom_tags: Annotated[Optional[list[str]], Field(description="Custom tags for the incident")] = None,
+        resolving_comment: Annotated[Optional[str], Field(description="Comment to explain the resolution of the incident and the classification choice")] = None,
     ) -> str:
         """Update fields on a Microsoft security incident, omitted fields remain unchanged."""
         updates: dict[str, Any] = {}
@@ -493,11 +542,12 @@ async def get_graph_tools(user_id: str) -> list[BaseTool]:
 
     return [
         get_incident_with_alerts,
+        get_table_schema,
         run_hunting_query,
         search_threat_intelligence,
-        hunt_user_blast_radius,
-        hunt_host_blast_radius,
-        hunt_ip_blast_radius,
+        search_user_blast_radius,
+        search_host_blast_radius,
+        search_ip_blast_radius,
         add_incident_comment,
         update_incident,
     ]
@@ -583,6 +633,7 @@ def main() -> None:
                 return
             try:
                 mcp_tools = await get_mcp_tools(user_id)
+                azure_tools = await get_azure_tools(user_id)
                 graph_tools = await get_graph_tools(user_id)
             except AuthenticationRequired:
                 # Send authentication card to trigger auth code flow if user_id not in accounts.
@@ -591,7 +642,7 @@ def main() -> None:
                 )
                 await context.send_activity(authentication_card(auth_url))
                 return
-            agent = setup_agent([current_utc_time, WebSearchTool(), *mcp_tools, *graph_tools])
+            agent = setup_agent([current_utc_time, WebSearchTool(), *mcp_tools, *azure_tools, *graph_tools])
             # Invoke the agent with the user's message and the current thread ID.
             result = await agent.ainvoke(
                 {"messages": [{"role": "user", "content": text}]},

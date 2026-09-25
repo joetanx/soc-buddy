@@ -32,6 +32,10 @@ dependencies = [
     # Microsoft Graph SDK
     "azure-core",
     "msgraph-sdk",
+
+    # Azure SDK
+    "azure-mgmt-resourcegraph",
+    "azure-mgmt-loganalytics",
 ]
 
 [build-system]
