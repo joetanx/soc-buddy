@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# ==============================================================================
+# ====================================================================================
 # SOC Buddy - Azure Infrastructure Deployment Script for Azure Cloud Shell
-# ==============================================================================
-# Deploys Azure resources using an ARM template, builds the container image
-# in Azure Container Registry (ACR), configures Managed Identity, creates the
-# Teams Bot Entra application and Azure Bot resource, sets up Federated Identity
-# Credentials (FIC) for Agent Blueprint & Teams Bot,
-# and grants delegated permissions for Microsoft Sentinel MCPs, Work IQ Mail MCP,
-# and Microsoft Graph Security Incidents and Threat Hunting.
-# ==============================================================================
+# ====================================================================================
+# Deploys Azure resources using an ARM template, builds the container image in ACR,
+# configures Managed Identity, creates the Azure Bot app registration and resource,
+# sets up FIC for Agent Blueprint & Azure Bot, and grants delegated permissions for
+# Work IQ Mail MCP, Azure, and Microsoft Graph Security Incidents and Threat Hunting.
+# ====================================================================================
 
 set -euo pipefail
 exec > "deploy_$(date +%F_%T).log" 2>&1
@@ -82,21 +80,22 @@ register_provider_if_needed "Microsoft.ContainerRegistry"
 register_provider_if_needed "Microsoft.CognitiveServices"
 register_provider_if_needed "Microsoft.BotService"
 
+# Sentinel MCP is deprecated
 # Ensure Sentinel Triage MCP Service Principal exists
-log_step "Verifying required Service Principals..."
-TRIAGE_MCP_SP_ID="7b7b3966-1961-47b5-b080-43ca5482e21c"
-if az ad sp show --id "$TRIAGE_MCP_SP_ID" &>/dev/null; then
-    log_info "Service Principal for Sentinel Triage MCP ($TRIAGE_MCP_SP_ID) already exists."
-else
-    log_info "Creating Service Principal for Sentinel Triage MCP ($TRIAGE_MCP_SP_ID)..."
-    if SP_OUTPUT=$(az ad sp create --id "$TRIAGE_MCP_SP_ID" 2>&1); then
-        log_success "Service Principal for Sentinel Triage MCP created successfully."
-    elif echo "$SP_OUTPUT" | grep -qi "already in use"; then
-        log_info "Service Principal for Sentinel Triage MCP already exists."
-    else
-        log_warn "Could not create Service Principal for Sentinel Triage MCP: $SP_OUTPUT"
-    fi
-fi
+# log_step "Verifying required Service Principals..."
+# TRIAGE_MCP_SP_ID="7b7b3966-1961-47b5-b080-43ca5482e21c"
+# if az ad sp show --id "$TRIAGE_MCP_SP_ID" &>/dev/null; then
+#     log_info "Service Principal for Sentinel Triage MCP ($TRIAGE_MCP_SP_ID) already exists."
+# else
+#     log_info "Creating Service Principal for Sentinel Triage MCP ($TRIAGE_MCP_SP_ID)..."
+#     if SP_OUTPUT=$(az ad sp create --id "$TRIAGE_MCP_SP_ID" 2>&1); then
+#         log_success "Service Principal for Sentinel Triage MCP created successfully."
+#     elif echo "$SP_OUTPUT" | grep -qi "already in use"; then
+#         log_info "Service Principal for Sentinel Triage MCP already exists."
+#     else
+#         log_warn "Could not create Service Principal for Sentinel Triage MCP: $SP_OUTPUT"
+#     fi
+# fi
 
 # ------------------------------------------------------------------------------
 # 2. Validate Prerequisites & Environment Variables
@@ -468,22 +467,27 @@ log_success "Blueprint access permission ('access_agent_as_user') configured on 
 log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 
 # Permission Definitions:
+# 1. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, SPN 93aac09f-5f9b-4b4c-aa45-c623a1b69342, DelegatedRoleId fa91a9e8-6808-4167-a950-8f1fe525b270, Scope Tools.ListInvoke.All
+# 2. Azure Tools:                   App 797f4846-ba00-4fd7-ba43-dac1f8f63013, SPN 71e36942-1dcc-468d-bb7f-6ca533a87559, DelegatedRoleId 41094075-9dad-400e-a0bd-54e686782033, Scope user_impersonation
+# 3. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId 128ca929-1a19-45e6-a3b8-435ec44a36ba, Scope SecurityIncident.ReadWrite.All
+#                                   App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId b152eca8-ea73-4a48-8c98-1a6742673d99, Scope ThreatHunting.Read.All
+
+# Deprecated Sentinel MCP Permissions:
 # 1. Sentinel MCP Data Exploration: App 4500ebfb-89b6-4b14-a480-7f749797bfcd, SPN eaff9684-612c-4add-aa10-035fd3bfe3d1, DelegatedRoleId 991a963a-4203-4dbc-acf2-254a258f76f2, Scope SentinelPlatform.DelegatedAccess
 # 2. Sentinel MCP Triage:           App 7b7b3966-1961-47b5-b080-43ca5482e21c, SPN 8dd500d0-c3aa-4380-96d1-09b4b6233eff, DelegatedRoleId 69b8d760-4df6-4017-a3e6-1a8049cbce42, Scope MCP.Read.All
-# 3. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, SPN 93aac09f-5f9b-4b4c-aa45-c623a1b69342, DelegatedRoleId fa91a9e8-6808-4167-a950-8f1fe525b270, Scope Tools.ListInvoke.All
-# 4. Azure Tools:                   App 797f4846-ba00-4fd7-ba43-dac1f8f63013, SPN 71e36942-1dcc-468d-bb7f-6ca533a87559, DelegatedRoleId 41094075-9dad-400e-a0bd-54e686782033, Scope user_impersonation
-# 5. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId 128ca929-1a19-45e6-a3b8-435ec44a36ba, Scope SecurityIncident.ReadWrite.All
-#                                   App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId b152eca8-ea73-4a48-8c98-1a6742673d99, Scope ThreatHunting.Read.All
 
 # Step 7A: Allow agent identities created from the Blueprint to inherit delegated permissions
 BLUEPRINT_OBJECT_ID=$(az ad app show --id "$BLUEPRINT_CLIENT_ID" --query id -o tsv)
 INHERITABLE_PERMISSIONS_ENDPOINT="https://graph.microsoft.com/v1.0/applications/${BLUEPRINT_OBJECT_ID}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions"
 INHERITABLE_PERMISSIONS=$(az rest --method get --url "$INHERITABLE_PERMISSIONS_ENDPOINT" --output json)
-# This section only handles Sentinel MCP inheritable permissions as Graph and Work IQ are covered by a365 CLI
+
+# Check if Blueprint already has inheritable permissions for each resource app ID before adding them.
+# Work IQ and Microsoft Graph inheritable permissions should already be handled separately by a365 CLI.
+
 PERMISSION_RESOURCE_IDS=(
-    "4500ebfb-89b6-4b14-a480-7f749797bfcd"
-    "7b7b3966-1961-47b5-b080-43ca5482e21c"
+    "16b1878d-62c7-4009-aa25-68989d63bbad"
     "797f4846-ba00-4fd7-ba43-dac1f8f63013"
+    "00000003-0000-0000-c000-000000000000"
 )
 
 for resource_app_id in "${PERMISSION_RESOURCE_IDS[@]}"; do
@@ -492,11 +496,11 @@ import json, sys
 permissions = json.load(sys.stdin).get("value", [])
 sys.exit(0 if any(item.get("resourceAppId") == sys.argv[1] for item in permissions) else 1)
 ' "$resource_app_id" <<< "$INHERITABLE_PERMISSIONS"; then
-        log_info "Sentinel MCP resource $resource_app_id is already inheritable from the Blueprint."
+        log_info "Resource $resource_app_id is already inheritable from the Blueprint."
         continue
     fi
 
-    log_info "Adding Sentinel MCP resource $resource_app_id as an inheritable Blueprint permission..."
+    log_info "Adding resource $resource_app_id as an inheritable Blueprint permission..."
     INHERITABLE_PERMISSION_BODY=$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -510,7 +514,7 @@ print(json.dumps({
         --body "$INHERITABLE_PERMISSION_BODY" \
         --output none
 done
-log_success "Sentinel MCP inheritable permissions configured on Blueprint."
+log_success "Inheritable permissions configured on Blueprint."
 
 # Step 7B: Update Blueprint App Registration requiredResourceAccess
 python3 -c "
@@ -521,14 +525,6 @@ current_rra_str = subprocess.check_output(['az', 'ad', 'app', 'show', '--id', bp
 current_rra = json.loads(current_rra_str) if current_rra_str and current_rra_str != 'null' else []
 
 target_permissions = [
-    {
-        'resourceAppId': '4500ebfb-89b6-4b14-a480-7f749797bfcd',
-        'resourceAccess': [{'id': '991a963a-4203-4dbc-acf2-254a258f76f2', 'type': 'Scope'}]
-    },
-    {
-        'resourceAppId': '7b7b3966-1961-47b5-b080-43ca5482e21c',
-        'resourceAccess': [{'id': '69b8d760-4df6-4017-a3e6-1a8049cbce42', 'type': 'Scope'}]
-    },
     {
         'resourceAppId': '16b1878d-62c7-4009-aa25-68989d63bbad',
         'resourceAccess': [{'id': 'fa91a9e8-6808-4167-a950-8f1fe525b270', 'type': 'Scope'}]
@@ -591,9 +587,8 @@ pwsh -NoProfile -Command "
 
     # Resource definitions: Resource App ID -> Scope Name
     \$resources = @{
-        '4500ebfb-89b6-4b14-a480-7f749797bfcd' = 'SentinelPlatform.DelegatedAccess'
-        '7b7b3966-1961-47b5-b080-43ca5482e21c' = 'MCP.Read.All'
         '16b1878d-62c7-4009-aa25-68989d63bbad' = 'Tools.ListInvoke.All'
+        '797f4846-ba00-4fd7-ba43-dac1f8f63013' = 'user_impersonation'
         '00000003-0000-0000-c000-000000000000' = @('SecurityIncident.ReadWrite.All', 'ThreatHunting.Read.All')
     }
 

@@ -1,3 +1,5 @@
+# Archived version using agent user and Sentinel MCP.
+# Sentinel MCP is deprecated, rework needed if agent user version is to be used.
 import sys, logging, asyncio, jwt, time
 from os import environ
 from datetime import UTC, datetime

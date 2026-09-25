@@ -5,10 +5,12 @@ SOC Buddy is a security operations companion for security teams using Microsoft 
 It helps analysts triage/manage incidents, execute KQL threat hunts, inspect evidences, and draft communications directly within Microsoft Teams.
 
 It is built on LangChain with Agent 365 observability integration, and uses on-behalf-of user access with the following tools:
-- [Sentinel MCP](https://learn.microsoft.com/en-us/azure/sentinel/datalake/sentinel-mcp-overview)
-  - [Data exploration](https://learn.microsoft.com/en-us/azure/sentinel/datalake/sentinel-mcp-data-exploration-tool)
-  - [Triage](https://learn.microsoft.com/en-us/azure/sentinel/datalake/sentinel-mcp-triage-tool)
+- Azure management tools
+  - `list_workspaces` discovers Microsoft Sentinel-enabled Log Analytics workspaces.
+  - `list_tables_in_workspace` lists the tables in a selected workspace.
 - [Microsoft Graph Security API](https://learn.microsoft.com/en-us/graph/api/resources/security-api-overview)
+  - `get_table_schema` retrieves a Log Analytics table schema.
+  - `run_hunting_query` runs custom KQL, while dedicated threat-intelligence and user, host, and IP blast-radius tools handle common investigation workflows.
   - [Create comment](https://learn.microsoft.com/en-us/graph/api/security-incident-post-comments)
   - [Update incident](https://learn.microsoft.com/en-us/graph/api/security-incident-update)
 - [Work IQ Mail](https://learn.microsoft.com/en-us/microsoft-copilot-studio/mcp-mail-tools)
@@ -51,13 +53,13 @@ graph TB
         Foundry(Foundry Model)
         Agent -->|Inference| Foundry
     end
-    subgraph "Downstream MCP & Graph APIs"
-        MCP_Sentinel[Sentinel MCP]
+    subgraph "Downstream Azure, MCP & Graph APIs"
+        ARM[Azure Resource Manager]
         MCP_Mail[Work IQ Mail MCP]
         Graph[Microsoft Graph Security API]
-        Tools -->|4a. Investigate & Hunt| MCP_Sentinel
+        Tools -->|4a. Discover workspaces & tables| ARM
         Tools -->|4b. Send email| MCP_Mail
-        Tools -->|4c. Update incident| Graph
+        Tools -->|4c. Investigate, hunt & update incidents| Graph
     end
     subgraph "Agent 365"
         a365obs(Agent 365 Observability Service)
@@ -74,7 +76,8 @@ graph TB
 | Azure Container App (SOC Buddy Service) | - Runs image from Container Registry.<br>- Expose `aiohttp` running the Microsoft Agents SDK and LangChain.<br>- Integrates `MultiServerMCPClient` to connect dynamically to remote Model Context Protocol (MCP) endpoints. |
 | Microsoft Foundry | Provides foundational LLM capabilities (e.g., `gpt-5.6-luna`). The Container App authenticates directly to Foundry using Azure User-Assigned Managed Identity (UAMI), requiring no API keys. |
 | Remote MCP Servers | Standardized tool providers running over Streamable HTTP transports. Each MCP server requires bearer token authentication issued by Microsoft Entra ID. |
-| Microsoft Graph Security API | Native REST interface for reading, commenting on, assigning, and closing security incidents across Microsoft Defender XDR and Sentinel. |
+| Azure Resource Manager | Discovers Sentinel-enabled Log Analytics workspaces through Azure Resource Graph and lists workspace tables through the Log Analytics management API. |
+| Microsoft Graph Security API | Native interface for reading and updating Microsoft Defender XDR and Sentinel incidents, retrieving table schemas, and running KQL threat-hunting queries. |
 
 ### 0.3. Repository Structure
 
@@ -109,7 +112,7 @@ Deploying SOC Buddy interacts with Azure Subscription resources and Microsoft En
 | Contributor | Azure RBAC / Subscription | Create Azure resources. |
 | User Access Administrator | Azure RBAC / Subscription | Assign `Cognitive Services User` and `AcrPull` roles to the User-Assigned Managed Identity (UAMI). |
 | Cloud Application Administrator / Application Administrator | Entra ID / User | Create service principal; Add Federated Identity Credentials (FIC) to the Agent Blueprint and Teams Bot app registrations. |
-| Privileged Role Administrator | Entra ID / User | Grant tenant-wide Admin Consent for delegated scopes on the Blueprint (`SecurityIncident.ReadWrite.All`, `ThreatHunting.Read.All`, Sentinel MCP scopes). |
+| Privileged Role Administrator | Entra ID / User | Grant tenant-wide Admin Consent for delegated scopes on the Blueprint (Azure Service Management `user_impersonation`, `SecurityIncident.ReadWrite.All`, `ThreatHunting.Read.All`, and Work IQ Mail `Tools.ListInvoke.All`). |
 | AI Administrator | Entra ID / User | Publish agent manifest in Microsoft 365 Admin Center. |
 
 ### 1.2. Provision Agent Identity  with a365 CLI
@@ -212,7 +215,6 @@ flowchart TD
 1. Environment & Prerequisite Checks
     - Verify `az`, `pwsh`, and `python3` are available
     - Ensure resource providers `Microsoft.App`, `Microsoft.OperationalInsights`, `Microsoft.ContainerRegistry`, `Microsoft.CognitiveServices`, and `Microsoft.BotService` are registered
-    - Ensure Sentinel Triage MCP Service Principal exists
 2. Validate Prerequisites & Environment Variables
     - Check that `a365.generated.config.json` and `azuredeploy.json` files exist
     - Check required environment variables (`APP_NAME`, `LOCATION`), and default `FOUNDRY_MODEL` to `gpt-5.6-luna`
@@ -241,8 +243,8 @@ flowchart TD
     - Add UAMI as FIC to agent blueprint and Teams bot app
     - Configure redirect URI and agent blueprint API permission on Teams bot app
 7. Configure Required API Permissions & Grant Admin Consent
-    - Add the Sentinel Data Exploration and Triage MCP resources to the agent blueprint's inheritable permissions
-    - Assign MCP and API permissions to agent blueprint
+    - Add Azure Service Management, Microsoft Graph Security, and Work IQ Mail resources to the agent blueprint's inheritable permissions
+    - Assign `user_impersonation`, `SecurityIncident.ReadWrite.All`, `ThreatHunting.Read.All`, and `Tools.ListInvoke.All` delegated permissions to the agent blueprint
     - Grant admin consent for assigned permissions
     - Verify permissions granted
 8. Completion & Next Steps Summary

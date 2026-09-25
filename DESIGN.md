@@ -158,13 +158,13 @@ sequenceDiagram
     autonumber
     participant Bot as SOC Buddy Container
     participant Entra as Microsoft Entra ID
-    participant MCP as Sentinel MCP / Graph API
+    participant MCP as Work IQ MCP /<br>Azure and Graph API
 
     Bot->>Bot: acquire_token_silent_with_error(scope: access_agent_as_user)
     Bot->>Entra: POST /oauth2/v2.0/token (OBO Request)<br/>grant_type=jwt-bearer<br/>assertion=<user_access_token><br/>client_assertion=<blueprint_token><br/>scope=<downstream_scope>
     Entra-->>Bot: Downstream Access Token (issued for Analyst)
     Bot->>MCP: HTTP Request + Authorization: Bearer <downstream_token>
-    MCP-->>Bot: Triage / Query Results
+    MCP-->>Bot: Tool Use Results
 ```
 
 1. `get_obo_token(user_id, scopes)` locates the analyst's account in `msal_token_cache`.
@@ -182,9 +182,9 @@ sequenceDiagram
     participant Teams as Microsoft Teams
     participant App as SOC Buddy (Container App)
     participant Entra as Microsoft Entra ID
-    participant Foundry as Azure AI Foundry (LLM)
-    participant MCP as Sentinel & Defender MCPs
-    participant Graph as Microsoft Graph Security
+    participant Foundry as Foundry (LLM)
+    participant MCP as Azure API
+    participant Graph as Graph API
 
     Analyst->>Teams: "Summarize incident 4821 and add a note stating we are investigating."
     Teams->>App: POST /api/messages
@@ -192,8 +192,8 @@ sequenceDiagram
     App->>App: Populate OpenTelemetry baggage (Tenant & Agent ID)
     
     App->>Entra: Silent token acquisition for user assertion
-    App->>Entra: OBO Exchange -> Sentinel Triage Token
-    App->>Entra: OBO Exchange -> Graph Security Token
+    App->>Entra: OBO Exchange -> Azure Token
+    App->>Entra: OBO Exchange -> Graph Token
     
     App->>MCP: get_incident(incident_id="4821") [Bearer token]
     MCP-->>App: Incident details, alerts, and entities
@@ -217,40 +217,59 @@ sequenceDiagram
 
 | Resource API | Application ID | Object ID | Scope Name | Type | Purpose |
 |---|---|---|---|---|---|
-| Sentinel Platform Services<br>(Sentinel MCP Data Exploration) | `4500ebfb-89b6-4b14-a480-7f749797bfcd` | `eaff9684-612c-4add-aa10-035fd3bfe3d1` | `SentinelPlatform.DelegatedAccess` | Delegated (OBO) | Execute KQL hunting queries, discover workspace tables, read log telemetry. |
-| Microsoft Defender Mcp<br>(Sentinel MCP Triage) | `7b7b3966-1961-47b5-b080-43ca5482e21c` | `8dd500d0-c3aa-4380-96d1-09b4b6233eff` | `MCP.Read.All` | Delegated (OBO) | Inspect Defender XDR incidents, alert evidence, impacted devices, and identities. |
 | Work IQ Mail MCP | `16b1878d-62c7-4009-aa25-68989d63bbad` | `93aac09f-5f9b-4b4c-aa45-c623a1b69342` | `Tools.ListInvoke.All` | Delegated (OBO) | Read analyst email notifications, search incident email threads, draft communications. |
+| Azure Service Management | `797f4846-ba00-4fd7-ba43-dac1f8f63013` | `71e36942-1dcc-468d-bb7f-6ca533a87559` | `user_impersonation` | Delegated (OBO) | Discover Sentinel-enabled Log Analytics workspaces and enumerate their tables. |
 | Microsoft Graph | `00000003-0000-0000-c000-000000000000` | `aaad2076-26ab-4905-b1eb-090f627b17d7` | `SecurityIncident.ReadWrite.All` | Delegated (OBO) | Post comments to incidents and update status, classification, determination, and tags. |
 | Microsoft Graph | `00000003-0000-0000-c000-000000000000` | `b152eca8-ea73-4a48-8c98-1a6742673d99` | `ThreatHunting.Read.All` | Delegated (OBO) | Run Microsoft Defender hunting queries on behalf of the signed-in analyst. |
 | Agent365Observability | `9b975845-388f-4429-889e-eab1ef63949c` | `a3af7c4d-8203-45c5-a467-ea084e2bbcfa` | `Agent365.Observability.OtelWrite` | Application (S2S) | Export agent spans, traces, and metrics to Microsoft Agent 365 control plane. |
 
-### 2.2. Sentinel MCP Data Exploration Tools
+#### 2.1.1. Native Tool-to-API Mapping
 
-- Base URL: `https://sentinel.microsoft.com/mcp/data-exploration`
-- Authentication: Bearer token with scope `4500ebfb-89b6-4b14-a480-7f749797bfcd/SentinelPlatform.DelegatedAccess`
-- Transport: Streamable HTTP (`langchain_mcp_adapters.client.MultiServerMCPClient`)
+```mermaid
+flowchart LR
+    subgraph AzureTools["Azure management tools"]
+        listWorkspaces["list_workspaces"]
+        listTables["list_tables_in_workspace"]
+    end
 
-| Tool Name | Description | Key Parameters |
-|---|---|---|
-| `runKqlQuery` | Executes read-only KQL queries across Log Analytics workspaces connected to Sentinel. | `workspaceId`, `query`, `timespan` |
-| `listTables` | Enumerates available security and operational tables (e.g., `DeviceProcessEvents`, `SigninLogs`, `SecurityEvent`). | `workspaceId` |
-| `getTableSchema` | Retrieves schema definitions and column types for a specific log table. | `workspaceId`, `tableName` |
-| `listWorkspaces` | Discovers Sentinel workspaces accessible to the authenticated analyst. | None |
+    subgraph GraphTools["Microsoft Graph security tools"]
+        getIncident["get_incident_with_alerts"]
+        getSchema["get_table_schema"]
+        runHunt["run_hunting_query"]
+        searchTI["search_threat_intelligence"]
+        searchUser["search_user_blast_radius"]
+        searchHost["search_host_blast_radius"]
+        searchIP["search_ip_blast_radius"]
+        addComment["add_incident_comment"]
+        updateIncident["update_incident"]
+    end
 
-### 2.3. Sentinel MCP Defender Triage Tools
+    subgraph AzureAPIs["Azure Resource Manager APIs"]
+        resourceGraph["Azure Resource Graph<br/>resources query"]
+        logAnalytics["Log Analytics management API<br/>workspaces/tables"]
+    end
 
-- Base URL: `https://sentinel.microsoft.com/mcp/triage`
-- Authentication: Bearer token with scope `7b7b3966-1961-47b5-b080-43ca5482e21c/MCP.Read.All`
-- Transport: Streamable HTTP
+    subgraph GraphAPIs["Microsoft Graph Security API"]
+        incidents["GET /security/incidents<br/>filter by ID and expand alerts"]
+        hunting["POST /security/runHuntingQuery"]
+        comments["POST /security/incidents/{id}/comments"]
+        incident["PATCH /security/incidents/{id}"]
+    end
 
-| Tool Name | Description | Key Parameters |
-|---|---|---|
-| `getIncident` | Fetches comprehensive details for a specific Defender XDR / Sentinel incident. | `incidentId` |
-| `listAlertsForIncident` | Lists alerts associated with an incident, including severity, MITRE tactics, and detector sources. | `incidentId` |
-| `getAlertEvidence` | Retrieves entities and evidence (files, IPs, URLs, processes, registry keys) linked to an alert. | `alertId` |
-| `getEntityDetails` | Obtains enriched identity or device details (Entra account risk, device health, Defender status). | `entityId`, `entityType` |
+    listWorkspaces --> resourceGraph
+    listTables --> logAnalytics
+    getIncident --> incidents
+    getSchema --> hunting
+    runHunt --> hunting
+    searchTI --> hunting
+    searchUser --> hunting
+    searchHost --> hunting
+    searchIP --> hunting
+    addComment --> comments
+    updateIncident --> incident
+```
 
-### 2.4. Work IQ Mail MCP Tools
+### 2.2. Work IQ Mail MCP Tools
 
 - Base URL: `https://agent365.svc.cloud.microsoft/agents/servers/mcp_MailTools`
 - Authentication: Bearer token with scope `16b1878d-62c7-4009-aa25-68989d63bbad/Tools.ListInvoke.All`
@@ -262,25 +281,40 @@ sequenceDiagram
 | `readEmail` | Reads the body and headers of a specific email message. | `messageId` |
 | `draftEmail` | Prepares an email draft for the analyst to review before sending incident updates to stakeholders. | `to`, `subject`, `body` |
 
-### 2.5. Microsoft Graph Security Incident Tools
+### 2.3. Azure Management tools
+
+Implemented natively in Python using the Azure Resource Graph and Log Analytics management SDKs.
+
+- Authentication: ****** with scope `https://management.azure.com/.default` (negotiated with Azure Service Management `user_impersonation`)
+- Authorization: The signed-in analyst must have Azure RBAC access to the queried subscriptions and workspaces.
+
+| Tool | Description | Key Parameters |
+|---|---|---|
+| `list_workspaces` | Uses Azure Resource Graph to discover accessible Log Analytics workspaces with a Microsoft Sentinel (`SecurityInsights`) solution. Returns the subscription ID, resource group, workspace name, and workspace GUID needed by the other tools. | None |
+| `list_tables_in_workspace` | Uses the Log Analytics management API to list every table name in a selected workspace. | `subscription_id`, `resource_group_name`, `workspace_name` |
+
+### 2.4. Microsoft Graph Security Incident Tools
 
 Implemented natively in Python using the `msgraph-sdk` and `GraphServiceClient`.
 - Target URL: `https://graph.microsoft.com/v1.0/security/incidents`
 - Authentication: Bearer token with scope `https://graph.microsoft.com/.default` (negotiated with `SecurityIncident.ReadWrite.All` and `ThreatHunting.Read.All`)
 
-#### 2.5.1. Threat Hunting Tools
+#### 2.4.1. Threat Hunting Tools
 
 | Tool | Description | Key Parameters |
 |---|---|---|
+| `get_table_schema` | Runs the KQL `getschema` operator for a Log Analytics table. | `table_name`, `workspace_id` |
 | `run_hunting_query` | Executes custom KQL hunts not covered by a dedicated hunting tool. | `query`, `timespan`, `workspace_id` |
-| `search_threat_intelligence` | Checks indicators against the latest matching `ThreatIntelIndicators` records. | `indicators`, `timespan` |
-| `hunt_user_blast_radius` | Searches `SigninLogs.Identity`, `SecurityEvent.Account`, and `Syslog.SyslogMessage` for incident user entities. | `users`, `timespan`, `workspace_id` |
-| `hunt_host_blast_radius` | Searches `SecurityEvent.Computer` and `Syslog.HostName` for incident host entities. | `hosts`, `timespan`, `workspace_id` |
-| `hunt_ip_blast_radius` | Searches `SigninLogs.IPAddress`, `SecurityEvent.IpAddress`, and `Syslog.SyslogMessage` for incident IP entities. | `ip_addresses`, `timespan`, `workspace_id` |
+| `search_threat_intelligence` | Checks IP addresses, domains, URLs, and hashes against the latest matching `ThreatIntelIndicators` records. | `indicators`, `timespan`, `workspace_id` |
+| `search_user_blast_radius` | Searches `SigninLogs.Identity`, `SecurityEvent.Account`, and `Syslog.SyslogMessage` for incident user entities. | `users`, `timespan`, `workspace_id` |
+| `search_host_blast_radius` | Searches `SecurityEvent.Computer` and `Syslog.HostName` for incident host entities. | `hosts`, `timespan`, `workspace_id` |
+| `search_ip_blast_radius` | Searches `SigninLogs.IPAddress`, `SecurityEvent.IpAddress`, and `Syslog.SyslogMessage` for incident IP entities. | `ip_addresses`, `timespan`, `workspace_id` |
 
-The blast-radius tools combine their table-specific hunts with `union`, identify each result's source table, normalize `SigninLogs.IPAddress` and `SecurityEvent.IpAddress` to `SourceIp`, and default to the previous 72 hours (`P3D`). All other event fields are preserved. The dedicated tools should be preferred over generated KQL for incident user, host, and IP address entities. The general `run_hunting_query` tool remains available for other custom hunts.
+All hunting tools call the Microsoft Graph `security/runHuntingQuery` API. If `workspace_id` is omitted, Microsoft Graph uses the analyst's primary workspace. `run_hunting_query` and `search_threat_intelligence` default to the previous seven days (`P7D`); the blast-radius tools default to the previous 72 hours (`P3D`). `get_table_schema` does not apply a timespan.
 
-#### 2.5.2. `add_incident_comment`
+The blast-radius tools combine their table-specific hunts with `union`, identify each result's source table, normalize the `SecurityEvent.IpAddress` column to `IPAddress`, and order results by `TimeGenerated` descending. All other event fields are preserved. The dedicated tools should be preferred over generated KQL for incident user, host, and IP address entities. The general `run_hunting_query` tool remains available for other custom hunts.
+
+#### 2.4.2. `add_incident_comment`
 - Description: Appends an analytical comment or investigation note to a security incident.
 - Parameters:
     | Parameter | Type | Description |
@@ -289,7 +323,7 @@ The blast-radius tools combine their table-specific hunts with `union`, identify
     | `comment` | `str` | Body text of the comment to record. |
 - REST Equivalent: `POST https://graph.microsoft.com/v1.0/security/incidents/{incident_id}/comments`
 
-#### 2.5.3. `update_incident`
+#### 2.4.3. `update_incident`
 - Description: Updates incident lifecycle state, owner assignment, classification, determination, and tags.
 - Parameters:
     | Parameter | Type | Description |
@@ -303,7 +337,44 @@ The blast-radius tools combine their table-specific hunts with `union`, identify
     | `resolving_comment` | `Optional[str]` | Explanation of why the incident was closed or classified. |
 - REST Equivalent: `PATCH https://graph.microsoft.com/v1.0/security/incidents/{incident_id}`
 
-### 2.6. Built-In Utility Tools
+### 2.5. Built-In Utility Tools
 
 - `current_utc_time`: Returns the current UTC timestamp in ISO 8601 format to give the model accurate temporal context when filtering alerts or calculating time windows.
 - `WebSearchTool`: Built-in Azure AI web search tool enabling the model to search external intelligence feeds, CVE details, and vendor threat advisories.
+
+<details><summary><h2>3. Sentinel MCP Data Exploration and Triage Are Deprecated</h2></summary>
+
+The Sentinel MCP data exploration and Defender triage servers are retained below for historical reference only. They are no longer configured or granted permissions by SOC Buddy; native Azure management and Microsoft Graph Security tools replace them.
+
+| Resource API | Application ID | Object ID | Scope Name | Type | Purpose |
+|---|---|---|---|---|---|
+| Sentinel Platform Services<br>(Sentinel MCP Data Exploration) | `4500ebfb-89b6-4b14-a480-7f749797bfcd` | `eaff9684-612c-4add-aa10-035fd3bfe3d1` | `SentinelPlatform.DelegatedAccess` | Delegated (OBO) | Execute KQL hunting queries, discover workspace tables, read log telemetry. |
+| Microsoft Defender Mcp<br>(Sentinel MCP Triage) | `7b7b3966-1961-47b5-b080-43ca5482e21c` | `8dd500d0-c3aa-4380-96d1-09b4b6233eff` | `MCP.Read.All` | Delegated (OBO) | Inspect Defender XDR incidents, alert evidence, impacted devices, and identities. |
+
+### 3.1. Sentinel MCP Data Exploration Tools
+
+- Base URL: `https://sentinel.microsoft.com/mcp/data-exploration`
+- Authentication: Bearer token with scope `4500ebfb-89b6-4b14-a480-7f749797bfcd/SentinelPlatform.DelegatedAccess`
+- Transport: Streamable HTTP (`langchain_mcp_adapters.client.MultiServerMCPClient`)
+
+| Tool Name | Description | Key Parameters |
+|---|---|---|
+| `runKqlQuery` | Executes read-only KQL queries across Log Analytics workspaces connected to Sentinel. | `workspaceId`, `query`, `timespan` |
+| `listTables` | Enumerates available security and operational tables (e.g., `DeviceProcessEvents`, `SigninLogs`, `SecurityEvent`). | `workspaceId` |
+| `getTableSchema` | Retrieves schema definitions and column types for a specific log table. | `workspaceId`, `tableName` |
+| `listWorkspaces` | Discovers Sentinel workspaces accessible to the authenticated analyst. | None |
+
+### 3.2. Sentinel MCP Defender Triage Tools
+
+- Base URL: `https://sentinel.microsoft.com/mcp/triage`
+- Authentication: Bearer token with scope `7b7b3966-1961-47b5-b080-43ca5482e21c/MCP.Read.All`
+- Transport: Streamable HTTP
+
+| Tool Name | Description | Key Parameters |
+|---|---|---|
+| `getIncident` | Fetches comprehensive details for a specific Defender XDR / Sentinel incident. | `incidentId` |
+| `listAlertsForIncident` | Lists alerts associated with an incident, including severity, MITRE tactics, and detector sources. | `incidentId` |
+| `getAlertEvidence` | Retrieves entities and evidence (files, IPs, URLs, processes, registry keys) linked to an alert. | `alertId` |
+| `getEntityDetails` | Obtains enriched identity or device details (Entra account risk, device health, Defender status). | `entityId`, `entityType` |
+
+</details>

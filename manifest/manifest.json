@@ -15,7 +15,7 @@
   },
   "description": {
     "short": "Security operations assistant built on LangChain.",
-    "full": "Security operations assistant built on LangChain; equipped with Sentinel MCP data exploration and triage tool, as well as Work IQ mail tool to send email."
+    "full": "Security operations assistant built on LangChain with Azure workspace discovery, Microsoft Graph incident and threat-hunting tools, and Work IQ mail tools."
   },
   "icons": {
     "outline": "outline.png",
