@@ -9,7 +9,7 @@
 # ====================================================================================
 
 set -euo pipefail
-exec > "deploy_$(date +%F_%T).log" 2>&1
+exec > >(tee -a "deploy_$(date +%F_%T).log") 2>&1
 
 # Text formatting
 RED='\033[0;31m'
@@ -35,11 +35,6 @@ log_step "Checking Azure Cloud Shell prerequisites..."
 
 if ! command -v az &> /dev/null; then
     log_error "Azure CLI ('az') is not installed or not in PATH."
-    exit 1
-fi
-
-if ! command -v pwsh &> /dev/null; then
-    log_error "PowerShell ('pwsh') is not installed or not in PATH. Azure Cloud Shell includes pwsh by default."
     exit 1
 fi
 
@@ -138,19 +133,16 @@ fi
 
 RG="rg-${APP_NAME}"
 FOUNDRY_MODEL="${FOUNDRY_MODEL:-gpt-5.6-luna}"
-BOT_NAME="${APP_NAME}-bot"
-BOT_APP_DISPLAY_NAME="${APP_NAME} Teams Bot"
 
-if [[ ! "$BOT_NAME" =~ ^[A-Za-z0-9_-]{4,42}$ ]]; then
-    log_error "The generated Azure Bot name '$BOT_NAME' is invalid."
-    log_error "It must contain 4-42 letters, numbers, underscores, or hyphens."
+if [[ ! "$APP_NAME" =~ ^[a-z][a-z0-9-]{0,30}[a-z0-9]$ ]] || [[ "$APP_NAME" == *"--"* ]]; then
+    log_error "The application name '$APP_NAME' is invalid."
+    log_error "Use 2-32 lowercase letters, digits, or single hyphens; start with a letter and end with a letter or digit."
     exit 1
 fi
 
 log_info "Application Name:   ${BOLD}${APP_NAME}${NC}"
 log_info "Azure Region:       ${BOLD}${LOCATION}${NC}"
 log_info "Resource Group:     ${BOLD}${RG}${NC}"
-log_info "Azure Bot Name:     ${BOLD}${BOT_NAME}${NC}"
 log_info "Foundry Model:      ${BOLD}${FOUNDRY_MODEL}${NC}"
 
 # Parse a365.generated.config.json
@@ -186,56 +178,6 @@ else
     log_info "Using existing Resource Group '$RG'."
 fi
 
-# Create or reuse the single-tenant Entra application used by Azure Bot.
-# On redeployment, the Azure Bot resource is the authoritative source for the
-# application ID. Before the bot exists, its exact display name is used.
-log_step "Creating Teams Bot identity..."
-
-TEAMS_BOT_CLIENT_ID=$(az bot show \
-    --name "$BOT_NAME" \
-    --resource-group "$RG" \
-    --query "properties.msaAppId" \
-    -o tsv 2>/dev/null || true)
-
-if [ -n "$TEAMS_BOT_CLIENT_ID" ]; then
-    if ! az ad app show --id "$TEAMS_BOT_CLIENT_ID" &>/dev/null; then
-        log_error "Azure Bot '$BOT_NAME' references Entra application '$TEAMS_BOT_CLIENT_ID', but that application cannot be found."
-        exit 1
-    fi
-    log_info "Using the Entra application associated with Azure Bot '$BOT_NAME'."
-else
-    mapfile -t EXISTING_BOT_APP_IDS < <(
-        az ad app list \
-            --display-name "$BOT_APP_DISPLAY_NAME" \
-            --query "[].appId" \
-            -o tsv
-    )
-
-    if [ ${#EXISTING_BOT_APP_IDS[@]} -gt 1 ]; then
-        log_error "Multiple Entra applications are named '$BOT_APP_DISPLAY_NAME'."
-        log_error "Remove or rename the duplicates, then rerun deploy.sh."
-        exit 1
-    elif [ ${#EXISTING_BOT_APP_IDS[@]} -eq 1 ]; then
-        TEAMS_BOT_CLIENT_ID="${EXISTING_BOT_APP_IDS[0]}"
-        log_info "Reusing Entra application '$BOT_APP_DISPLAY_NAME'."
-    else
-        log_info "Creating single-tenant Entra application '$BOT_APP_DISPLAY_NAME'..."
-        TEAMS_BOT_CLIENT_ID=$(az ad app create \
-            --display-name "$BOT_APP_DISPLAY_NAME" \
-            --sign-in-audience "AzureADMyOrg" \
-            --query "appId" \
-            -o tsv)
-        log_success "Created Teams Bot Entra application."
-    fi
-fi
-
-if ! az ad sp show --id "$TEAMS_BOT_CLIENT_ID" &>/dev/null; then
-    log_info "Creating Service Principal for Teams Bot application..."
-    az ad sp create --id "$TEAMS_BOT_CLIENT_ID" --output none
-fi
-
-log_info "Teams Bot Client ID: ${BOLD}${TEAMS_BOT_CLIENT_ID}${NC}"
-
 # Query model version dynamically for the requested model in the given location
 log_info "Resolving model version for '${FOUNDRY_MODEL}' in '${LOCATION}'..."
 FOUNDRY_MODEL_VERSION=$(az cognitiveservices model list -l "$LOCATION" \
@@ -250,10 +192,47 @@ fi
 log_info "Resolved model version: ${BOLD}${FOUNDRY_MODEL_VERSION}${NC}"
 
 # ------------------------------------------------------------------------------
-# 3. Deploy Infrastructure via ARM Template
+# 3. Setup Azure Bot identity
 # ------------------------------------------------------------------------------
+# Create or reuse single-tenant Entra application for Azure Bot.
+log_step "Creating Azure Bot identity..."
+
+CHECK_AZURE_BOT_CLIENT_ID=$(az ad app list --query "[?displayName == '${APP_NAME}'].appId" -o tsv)
+
+if [ -n "$CHECK_AZURE_BOT_CLIENT_ID" ]; then
+    AZURE_BOT_CLIENT_ID="$CHECK_AZURE_BOT_CLIENT_ID"
+    log_info "Reusing existing Azure Bot application."
+else
+    AZURE_BOT_CLIENT_ID=$(az ad app create \
+        --display-name "$APP_NAME" \
+        --sign-in-audience "AzureADMyOrg" \
+        --query "appId" -o tsv)
+    while ! az ad app show --id "$AZURE_BOT_CLIENT_ID" &>/dev/null; do
+        log_info "Waiting for Azure Bot application to be available..."
+        sleep 1
+    done
+fi
+
+CHECK_AZURE_BOT_SP_ID=$(az ad sp show --id $AZURE_BOT_CLIENT_ID --query "id" -o tsv 2>/dev/null)
+
+if [ -n "$CHECK_AZURE_BOT_SP_ID" ]; then
+    AZURE_BOT_SP_ID="$CHECK_AZURE_BOT_SP_ID"
+    log_info "Reusing existing Azure Bot service principal."
+else
+    AZURE_BOT_SP_ID=$(az ad sp create \
+        --id "$AZURE_BOT_CLIENT_ID" \
+        --query "id" -o tsv)
+fi
+
+log_info "Azure Bot Client ID: ${BOLD}${AZURE_BOT_CLIENT_ID}${NC}"
+log_info "Azure Bot SP ID:     ${BOLD}${AZURE_BOT_SP_ID}${NC}"
+
+# ------------------------------------------------------------------------------
+# 4. Deploy Infrastructure via ARM Template
+# ------------------------------------------------------------------------------
+
 log_step "Deploying Azure Infrastructure via ARM Template..."
-log_info "Provisioning Cognitive Services, ACR, Log Analytics, CAE, UAMI, RBAC roles, and Container App..."
+log_info "Provisioning Cognitive Services, ACR, Log Analytics, CAE, UAMI, RBAC roles, Container App, Azure Bot, and Teams channel..."
 
 DEPLOYMENT_NAME="deploy-${APP_NAME}-$(date +%s)"
 
@@ -267,7 +246,7 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
         blueprintClientId="$BLUEPRINT_CLIENT_ID" \
         agenticInstanceId="$AGENTIC_INSTANCE_ID" \
         tenantId="$TENANT_ID" \
-        teamsBotClientId="$TEAMS_BOT_CLIENT_ID" \
+        teamsBotClientId="$AZURE_BOT_CLIENT_ID" \
         foundryModelName="$FOUNDRY_MODEL" \
         foundryModelVersion="$FOUNDRY_MODEL_VERSION" \
     --query "properties.outputs" -o json)
@@ -287,61 +266,6 @@ log_info "UAMI Principal ID:   ${BOLD}${UAMI_ID}${NC}"
 log_info "UAMI Client ID:      ${BOLD}${UAMI_CLIENT_ID}${NC}"
 log_info "Messaging Endpoint:  ${BOLD}${MESSAGING_ENDPOINT}${NC}"
 log_info "OAuth Redirect URI:  ${BOLD}${OAUTH_REDIRECT_URI}${NC}"
-
-# ------------------------------------------------------------------------------
-# 4. Create Azure Bot Resource and Enable the Teams Channel
-# ------------------------------------------------------------------------------
-log_step "Creating Azure Bot resource..."
-
-EXISTING_AZURE_BOT_APP_ID=$(az bot show \
-    --name "$BOT_NAME" \
-    --resource-group "$RG" \
-    --query "properties.msaAppId" \
-    -o tsv 2>/dev/null || true)
-
-if [ -n "$EXISTING_AZURE_BOT_APP_ID" ]; then
-    if [ "$EXISTING_AZURE_BOT_APP_ID" != "$TEAMS_BOT_CLIENT_ID" ]; then
-        log_error "Azure Bot '$BOT_NAME' is associated with application '$EXISTING_AZURE_BOT_APP_ID'."
-        log_error "The deployment resolved Teams Bot application '$TEAMS_BOT_CLIENT_ID'."
-        log_error "Refusing to overwrite a bot associated with a different identity."
-        exit 1
-    fi
-
-    log_info "Updating Azure Bot messaging endpoint..."
-    az bot update \
-        --name "$BOT_NAME" \
-        --resource-group "$RG" \
-        --endpoint "$MESSAGING_ENDPOINT" \
-        --output none
-else
-    log_info "Creating single-tenant Azure Bot '$BOT_NAME'..."
-    az bot create \
-        --name "$BOT_NAME" \
-        --resource-group "$RG" \
-        --location "global" \
-        --sku "F0" \
-        --app-type "SingleTenant" \
-        --appid "$TEAMS_BOT_CLIENT_ID" \
-        --tenant-id "$TENANT_ID" \
-        --endpoint "$MESSAGING_ENDPOINT" \
-        --display-name "$APP_NAME" \
-        --description "Microsoft Teams bot for SOC Buddy" \
-        --output none
-fi
-
-if az bot msteams show \
-    --name "$BOT_NAME" \
-    --resource-group "$RG" &>/dev/null; then
-    log_info "Microsoft Teams channel is already enabled."
-else
-    log_info "Enabling the Microsoft Teams channel..."
-    az bot msteams create \
-        --name "$BOT_NAME" \
-        --resource-group "$RG" \
-        --output none
-fi
-
-log_success "Azure Bot is configured with endpoint '$MESSAGING_ENDPOINT'."
 
 # ------------------------------------------------------------------------------
 # 5. Build Container Image in ACR & Update Container App
@@ -381,13 +305,13 @@ else
 fi
 
 # Configure FIC, Web Redirect URI, and Blueprint API permission on Teams Bot App
-log_info "Configuring Teams Bot application ($TEAMS_BOT_CLIENT_ID)..."
+log_info "Configuring Teams Bot application ($AZURE_BOT_CLIENT_ID)..."
 
 # 1. Federated Identity Credential
-EXISTING_TB_FIC=$(az ad app federated-credential list --id "$TEAMS_BOT_CLIENT_ID" \
+EXISTING_TB_FIC=$(az ad app federated-credential list --id "$AZURE_BOT_CLIENT_ID" \
     --query "[?name=='${FIC_NAME}'].name" -o tsv 2>/dev/null || true)
 if [ -z "$EXISTING_TB_FIC" ]; then
-    az ad app federated-credential create --id "$TEAMS_BOT_CLIENT_ID" \
+    az ad app federated-credential create --id "$AZURE_BOT_CLIENT_ID" \
         --parameters "{
             \"name\": \"${FIC_NAME}\",
             \"issuer\": \"https://login.microsoftonline.com/${TENANT_ID}/v2.0\",
@@ -400,10 +324,10 @@ else
 fi
 
 # 2. Configure Web Redirect URI
-log_info "Configuring Web Redirect URI on Teams Bot application ($TEAMS_BOT_CLIENT_ID)..."
+log_info "Configuring Web Redirect URI on Teams Bot application ($AZURE_BOT_CLIENT_ID)..."
 mapfile -t CURRENT_REDIRECT_URIS < <(
     az ad app show \
-        --id "$TEAMS_BOT_CLIENT_ID" \
+        --id "$AZURE_BOT_CLIENT_ID" \
         --query "web.redirectUris[]" \
         -o tsv
 )
@@ -419,7 +343,7 @@ done
 if [ "$REDIRECT_URI_EXISTS" = false ]; then
     CURRENT_REDIRECT_URIS+=("$OAUTH_REDIRECT_URI")
     az ad app update \
-        --id "$TEAMS_BOT_CLIENT_ID" \
+        --id "$AZURE_BOT_CLIENT_ID" \
         --web-redirect-uris "${CURRENT_REDIRECT_URIS[@]}" \
         --output none
 fi
@@ -438,7 +362,7 @@ if [ -z "$SCOPE_ID" ]; then
 fi
 
 BOT_REQUIRED_RESOURCE_ACCESS=$(az ad app show \
-    --id "$TEAMS_BOT_CLIENT_ID" \
+    --id "$AZURE_BOT_CLIENT_ID" \
     --query "requiredResourceAccess" \
     -o json)
 
@@ -455,7 +379,7 @@ found = any(
 raise SystemExit(0 if found else 1)
 ' "$BLUEPRINT_CLIENT_ID" "$SCOPE_ID" <<< "$BOT_REQUIRED_RESOURCE_ACCESS"; then
     az ad app permission add \
-        --id "$TEAMS_BOT_CLIENT_ID" \
+        --id "$AZURE_BOT_CLIENT_ID" \
         --api "$BLUEPRINT_CLIENT_ID" \
         --api-permissions "${SCOPE_ID}=Scope"
 fi
@@ -479,161 +403,96 @@ log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 # Step 7A: Allow agent identities created from the Blueprint to inherit delegated permissions
 BLUEPRINT_OBJECT_ID=$(az ad app show --id "$BLUEPRINT_CLIENT_ID" --query id -o tsv)
 INHERITABLE_PERMISSIONS_ENDPOINT="https://graph.microsoft.com/v1.0/applications/${BLUEPRINT_OBJECT_ID}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions"
-INHERITABLE_PERMISSIONS=$(az rest --method get --url "$INHERITABLE_PERMISSIONS_ENDPOINT" --output json)
 
-# Check if Blueprint already has inheritable permissions for each resource app ID before adding them.
-# Work IQ and Microsoft Graph inheritable permissions should already be handled separately by a365 CLI.
+ensure_inheritable_permission() {
+    local resource_app_id=$1
+    local existing_resource_app_id
 
-PERMISSION_RESOURCE_IDS=(
-    "16b1878d-62c7-4009-aa25-68989d63bbad"
-    "797f4846-ba00-4fd7-ba43-dac1f8f63013"
-    "00000003-0000-0000-c000-000000000000"
-)
+    existing_resource_app_id=$(az rest \
+        --method get \
+        --url "$INHERITABLE_PERMISSIONS_ENDPOINT" \
+        --query "value[?resourceAppId=='${resource_app_id}'].resourceAppId | [0]" \
+        --output tsv)
 
-for resource_app_id in "${PERMISSION_RESOURCE_IDS[@]}"; do
-    if python3 -c '
-import json, sys
-permissions = json.load(sys.stdin).get("value", [])
-sys.exit(0 if any(item.get("resourceAppId") == sys.argv[1] for item in permissions) else 1)
-' "$resource_app_id" <<< "$INHERITABLE_PERMISSIONS"; then
+    if [ "$existing_resource_app_id" = "$resource_app_id" ]; then
         log_info "Resource $resource_app_id is already inheritable from the Blueprint."
-        continue
+        return
     fi
 
     log_info "Adding resource $resource_app_id as an inheritable Blueprint permission..."
-    INHERITABLE_PERMISSION_BODY=$(python3 -c '
-import json, sys
-print(json.dumps({
-    "resourceAppId": sys.argv[1],
-    "inheritableScopes": {"@odata.type": "microsoft.graph.allAllowedScopes"}
-}))
-' "$resource_app_id")
     az rest --method post \
         --url "$INHERITABLE_PERMISSIONS_ENDPOINT" \
         --headers "Content-Type=application/json" \
-        --body "$INHERITABLE_PERMISSION_BODY" \
+        --body "{\"resourceAppId\":\"${resource_app_id}\",\"inheritableScopes\":{\"@odata.type\":\"microsoft.graph.allAllowedScopes\"}}" \
         --output none
-done
+}
+
+# Work IQ and Microsoft Graph inheritable permissions should already be handled separately by a365 CLI.
+ensure_inheritable_permission "16b1878d-62c7-4009-aa25-68989d63bbad"
+ensure_inheritable_permission "797f4846-ba00-4fd7-ba43-dac1f8f63013"
+ensure_inheritable_permission "00000003-0000-0000-c000-000000000000"
+
 log_success "Inheritable permissions configured on Blueprint."
 
-# Step 7B: Update Blueprint App Registration requiredResourceAccess
-python3 -c "
-import subprocess, json
+# Step 8B: Declare delegated permissions on the Blueprint App Registration
+ensure_delegated_permission() {
+    local resource_app_id=$1
+    local scope_id=$2
+    local scope_name=$3
+    local existing_scope_id
 
-bp_id = '${BLUEPRINT_CLIENT_ID}'
-current_rra_str = subprocess.check_output(['az', 'ad', 'app', 'show', '--id', bp_id, '--query', 'requiredResourceAccess', '-o', 'json']).decode('utf-8').strip()
-current_rra = json.loads(current_rra_str) if current_rra_str and current_rra_str != 'null' else []
+    existing_scope_id=$(az ad app permission list \
+        --id "$BLUEPRINT_CLIENT_ID" \
+        --query "[?resourceAppId=='${resource_app_id}'].resourceAccess[] | [?id=='${scope_id}'].id | [0]" \
+        --output tsv)
 
-target_permissions = [
-    {
-        'resourceAppId': '16b1878d-62c7-4009-aa25-68989d63bbad',
-        'resourceAccess': [{'id': 'fa91a9e8-6808-4167-a950-8f1fe525b270', 'type': 'Scope'}]
-    },
-    {
-        'resourceAppId': '797f4846-ba00-4fd7-ba43-dac1f8f63013',
-        'resourceAccess': [{'id': '41094075-9dad-400e-a0bd-54e686782033', 'type': 'Scope'}]
-    },
-    {
-        'resourceAppId': '00000003-0000-0000-c000-000000000000',
-        'resourceAccess': [
-            {'id': '128ca929-1a19-45e6-a3b8-435ec44a36ba', 'type': 'Scope'},
-            {'id': 'b152eca8-ea73-4a48-8c98-1a6742673d99', 'type': 'Scope'}
-        ]
-    }
-]
+    if [ "$existing_scope_id" = "$scope_id" ]; then
+        log_info "Delegated permission '$scope_name' is already declared on the Blueprint."
+        return
+    fi
 
-# Merge into current_rra
-rra_map = {item['resourceAppId']: item for item in current_rra}
-for target in target_permissions:
-    app_id = target['resourceAppId']
-    if app_id not in rra_map:
-        rra_map[app_id] = target
-    else:
-        existing_ids = {ra['id'] for ra in rra_map[app_id].get('resourceAccess', [])}
-        for ra in target['resourceAccess']:
-            if ra['id'] not in existing_ids:
-                rra_map[app_id].setdefault('resourceAccess', []).append(ra)
+    log_info "Declaring delegated permission '$scope_name' on the Blueprint..."
+    az ad app permission add \
+        --id "$BLUEPRINT_CLIENT_ID" \
+        --api "$resource_app_id" \
+        --api-permissions "${scope_id}=Scope" \
+        --output none
+}
 
-merged_rra = list(rra_map.values())
-with open('/tmp/soc_buddy_merged_rra.json', 'w') as f:
-    json.dump(merged_rra, f)
-"
+ensure_delegated_permission \
+    "16b1878d-62c7-4009-aa25-68989d63bbad" \
+    "fa91a9e8-6808-4167-a950-8f1fe525b270" \
+    "Tools.ListInvoke.All"
+ensure_delegated_permission \
+    "797f4846-ba00-4fd7-ba43-dac1f8f63013" \
+    "41094075-9dad-400e-a0bd-54e686782033" \
+    "user_impersonation"
+ensure_delegated_permission \
+    "00000003-0000-0000-c000-000000000000" \
+    "128ca929-1a19-45e6-a3b8-435ec44a36ba" \
+    "SecurityIncident.ReadWrite.All"
+ensure_delegated_permission \
+    "00000003-0000-0000-c000-000000000000" \
+    "b152eca8-ea73-4a48-8c98-1a6742673d99" \
+    "ThreatHunting.Read.All"
 
-log_info "Updating requiredResourceAccess on Blueprint App..."
-az ad app update --id "$BLUEPRINT_CLIENT_ID" --required-resource-accesses @/tmp/soc_buddy_merged_rra.json
-rm -f /tmp/soc_buddy_merged_rra.json
+log_success "Blueprint delegated permissions declared."
 
-# Step 7C: Attempt admin consent via az cli
+# Step 8C: Attempt tenant-wide admin consent
 log_info "Attempting admin consent on Blueprint Application..."
-az ad app permission admin-consent --id "$BLUEPRINT_CLIENT_ID" 2>/dev/null || log_info "az ad app permission admin-consent completed or requires elevated admin."
-
-# Step 7D: Use PowerShell Microsoft Graph module to ensure Service Principals and OAuth2PermissionGrants exist
-log_info "Executing PowerShell Graph commands to ensure tenant-wide delegated grants..."
-pwsh -NoProfile -Command "
-    \$ErrorActionPreference = 'Continue'
-    \$bpClientId = '${BLUEPRINT_CLIENT_ID}'
-    
-    # Acquire Graph access token from az cli
-    \$token = (az account get-access-token --resource-type ms-graph --query accessToken -o tsv)
-    \$secToken = ConvertTo-SecureString \$token -AsPlainText -Force
-    Connect-MgGraph -AccessToken \$secToken -NoWelcome | Out-Null
-    
-    # 1. Ensure Blueprint Service Principal exists in tenant
-    \$clientSp = Get-MgServicePrincipal -Filter \"appId eq '\$bpClientId'\" -ErrorAction SilentlyContinue
-    if (-not \$clientSp) {
-        Write-Host \"Creating Service Principal for Blueprint \$bpClientId...\"
-        \$clientSp = New-MgServicePrincipal -AppId \$bpClientId
-    }
-
-    # Resource definitions: Resource App ID -> Scope Name
-    \$resources = @{
-        '16b1878d-62c7-4009-aa25-68989d63bbad' = 'Tools.ListInvoke.All'
-        '797f4846-ba00-4fd7-ba43-dac1f8f63013' = 'user_impersonation'
-        '00000003-0000-0000-c000-000000000000' = @('SecurityIncident.ReadWrite.All', 'ThreatHunting.Read.All')
-    }
-
-    foreach (\$resourceAppId in \$resources.Keys) {
-        \$requiredScopes = @(\$resources[\$resourceAppId])
-        Write-Host \"Configuring grant for Resource: \$resourceAppId, Scopes: \$(\$requiredScopes -join ' ')...\"
-        
-        # Ensure resource service principal exists
-        \$resSp = Get-MgServicePrincipal -Filter \"appId eq '\$resourceAppId'\" -ErrorAction SilentlyContinue
-        if (-not \$resSp) {
-            try {
-                \$resSp = New-MgServicePrincipal -AppId \$resourceAppId -ErrorAction Stop
-            } catch {
-                Write-Warning \"Could not create service principal for \$resourceAppId. It may already exist or require admin provisioning.\"
-            }
-        }
-        
-        if (\$resSp) {
-            # Check or create/update OAuth2PermissionGrant
-            \$grant = Get-MgOauth2PermissionGrant -Filter \"clientId eq '\$(\$clientSp.Id)' and resourceId eq '\$(\$resSp.Id)'\" -ErrorAction SilentlyContinue
-            if (\$grant) {
-                \$scopes = (\$grant.Scope -split '\s+') | Where-Object { \$_ -ne '' }
-                \$missingScopes = \$requiredScopes | Where-Object { \$scopes -notcontains \$_ }
-                if (\$missingScopes) {
-                    \$scopes += \$missingScopes
-                    \$newScope = (\$scopes | Select-Object -Unique) -join ' '
-                    Update-MgOauth2PermissionGrant -OAuth2PermissionGrantId \$grant.Id -Scope \$newScope
-                    Write-Host \"Updated grant with scope: \$newScope\"
-                } else {
-                    Write-Host \"Required scopes already granted.\"
-                }
-            } else {
-                try {
-                    \$newScope = \$requiredScopes -join ' '
-                    New-MgOauth2PermissionGrant -ClientId \$clientSp.Id -ResourceId \$resSp.Id -ConsentType 'AllPrincipals' -Scope \$newScope | Out-Null
-                    Write-Host \"Created new OAuth2PermissionGrant with scope: \$newScope\"
-                } catch {
-                    Write-Warning \"Failed to create OAuth2PermissionGrant for \${resourceAppId}: \$_\"
-                }
-            }
-        }
-    }
-"
-
-log_success "Permissions granted and verified."
+ADMIN_CONSENT_REQUIRED=false
+if ADMIN_CONSENT_OUTPUT=$(az ad app permission admin-consent --id "$BLUEPRINT_CLIENT_ID" 2>&1); then
+    log_success "Tenant-wide admin consent granted."
+elif grep -Eqi "insufficient|privilege|authorization|authorized|forbidden|global administrator" <<< "$ADMIN_CONSENT_OUTPUT"; then
+    ADMIN_CONSENT_REQUIRED=true
+    ADMIN_CONSENT_URL="https://login.microsoftonline.com/${TENANT_ID}/adminconsent?client_id=${BLUEPRINT_CLIENT_ID}"
+    log_warn "The signed-in account cannot grant tenant-wide admin consent."
+    log_warn "Ask a tenant administrator to grant consent out of band using this URL:"
+    echo -e "${YELLOW}${BOLD}${ADMIN_CONSENT_URL}${NC}"
+else
+    log_error "Failed to grant admin consent: $ADMIN_CONSENT_OUTPUT"
+    exit 1
+fi
 
 # ------------------------------------------------------------------------------
 # 8. Completion & Next Steps Summary
@@ -646,24 +505,32 @@ echo -e "${GREEN}${BOLD}========================================================
 echo -e "Application Name:       ${BOLD}${APP_NAME}${NC}"
 echo -e "Resource Group:         ${BOLD}${RG}${NC}"
 echo -e "Location:               ${BOLD}${LOCATION}${NC}"
-echo -e "Azure Bot Name:         ${BOLD}${BOT_NAME}${NC}"
 echo -e "Messaging Endpoint:     ${CYAN}${BOLD}${MESSAGING_ENDPOINT}${NC}"
 echo -e "OAuth Redirect URI:     ${CYAN}${BOLD}${OAUTH_REDIRECT_URI}${NC}"
 echo -e "Blueprint Client ID:    ${BOLD}${BLUEPRINT_CLIENT_ID}${NC}"
-echo -e "Teams Bot Client ID:    ${BOLD}${TEAMS_BOT_CLIENT_ID}${NC}"
+echo -e "Azure Bot Client ID:    ${BOLD}${AZURE_BOT_CLIENT_ID}${NC}"
 echo -e "UAMI Principal ID:      ${BOLD}${UAMI_ID}${NC}"
 echo -e "ACR Name:               ${BOLD}${ACR_NAME}${NC}"
 echo -e "AI Foundry Endpoint:    ${BOLD}${FOUNDRY_PROJECT_ENDPOINT}${NC}"
 echo -e "========================================================================"
 echo -e "${GREEN}${BOLD}AUTOMATICALLY CONFIGURED:${NC}"
-echo -e "1. Azure Bot resource '${BOT_NAME}' created or updated."
+echo -e "1. Azure Bot resource '${APP_NAME}' created."
 echo -e "2. Microsoft Teams channel enabled."
 echo -e "3. Messaging endpoint set to: ${CYAN}${MESSAGING_ENDPOINT}${NC}"
 echo -e "4. OAuth redirect URI set to: ${CYAN}${OAUTH_REDIRECT_URI}${NC}"
-echo -e "5. Blueprint access permission added to Bot App (${TEAMS_BOT_CLIENT_ID})."
+echo -e "5. Blueprint access permission added to Bot App (${AZURE_BOT_CLIENT_ID})."
+if [ "$ADMIN_CONSENT_REQUIRED" = true ]; then
+    echo -e "6. Blueprint delegated API permissions declared; admin consent is pending."
+else
+    echo -e "6. Blueprint delegated API permissions declared and admin consent granted."
+fi
 echo -e "========================================================================"
 echo -e "${YELLOW}${BOLD}POST-DEPLOYMENT ACTION REQUIRED:${NC}"
 echo -e "1. ${BOLD}Publish / Activate Agent Manifest in Microsoft 365 Admin Center:${NC}"
 echo -e "   - Run 'a365 publish' to produce manifest.zip"
 echo -e "   - Upload in M365 Admin Center (Settings > Integrated apps / Agents)"
+if [ "$ADMIN_CONSENT_REQUIRED" = true ]; then
+    echo -e "2. ${BOLD}Ask a tenant administrator to grant API consent:${NC}"
+    echo -e "   - ${YELLOW}${ADMIN_CONSENT_URL}${NC}"
+fi
 echo -e "========================================================================"

@@ -357,7 +357,7 @@ def _kql_search_regex(values: list[str], entity_type: str) -> str:
 
 # Construct tools that wrap Microsoft Graph API calls for use with LangChain.
 async def get_graph_tools(user_id: str) -> list[BaseTool]:
-    
+
     graph_token = await get_obo_token(user_id, ["https://graph.microsoft.com/.default"])
     graph_client = GraphServiceClient(
         GraphAccessTokenProvider(graph_token)

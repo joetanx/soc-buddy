@@ -39,8 +39,6 @@ properties:
           # Human-user authorization code flow
           - name: OAUTH_REDIRECT_URI
             value: "${OAUTH_REDIRECT_URI}"
-          - name: AUTH_FLOW_TTL_SECONDS
-            value: "600"
           # Teams bot connection settings
           - name: CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHORITY
             value: "https://login.microsoftonline.com/${TENANT_ID}"

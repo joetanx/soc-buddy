@@ -31,7 +31,7 @@
   },
   "bots": [
     {
-      "botId": "<teams-bot-id>",
+      "botId": "<azure-bot-id>",
       "scopes": [
         "personal",
         "team",
@@ -48,7 +48,7 @@
   "copilotAgents": {
     "customEngineAgents": [
       {
-        "id": "<teams-bot-id>",
+        "id": "<azure-bot-id>",
         "type": "bot"
       }
     ]

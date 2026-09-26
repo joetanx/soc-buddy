@@ -18,7 +18,7 @@ There are three distinct identities involved in SOC Buddy:
     - Uses UAMI assertion as FIC
 
 3. Agent Blueprint / Identity
-    - Represents the agent, acts as agent kill switch 
+    - Represents the agent, acts as agent kill switch
     - Possesses delegated scopes
     - Performs OBO token exchanges (second half of OBO flow)
     - Uses UAMI assertion as FIC
@@ -201,43 +201,43 @@ sequenceDiagram
     Teams->>App: POST /api/messages
     App->>App: Validate Teams Bot JWT
     App->>App: Populate OpenTelemetry baggage (Tenant & Agent ID)
-    
+
     App<<->>Entra: Silent token acquisition for user assertion
     App<<->>Entra: OBO Exchange -> Azure Token
     App<<->>Entra: OBO Exchange -> Graph Token
 
-    alt Initial context gathering    
+    alt Initial context gathering
         App->>Foundry: Chat completion (Prompt) [UAMI auth]
         Foundry-->>App: LLM decides to call get_incident tool
-        
-        App->>Graph: POST /security/incidents/4821 [Bearer token]
+
+        App->>Graph: GET /security/incidents/4821 [Bearer token]
         Graph-->>App: Incident details
     else Get workspaces
         App->>Foundry: Chat completion (Incident details) [UAMI auth]
         Foundry-->>App: LLM decides to hunt, need workspace IDs, call list_workspaces tool
-        
+
         App->>Azure: POST /providers/Microsoft.ResourceGraph/resources [Bearer token]
         Azure-->>App: List of Sentinel workspaces from resource graph query
     else Run hunting tools
         App->>Foundry: Chat completion (List of workspaces and IDs) [UAMI auth]
         Foundry-->>App: LLM decides call respective search_* tools
-        
+
         App->>Graph: POST /v1.0/security/runHuntingQuery [Bearer token]
         Graph-->>App: Hunt results
     else Summary and update
         App->>Foundry: Chat completion (Hunt results) [UAMI auth]
         Foundry-->>App: LLM decides analysis complete, call add_incident_comment tool and Work IQ Mail
-        
+
         App->>Graph: POST /v1.0/security/incidents/4821/comments [Bearer token]
         Graph-->>App: 201 Created
-        
+
         App->>WorkIQ: POST https://agent365.svc.cloud.microsoft/agents/servers/mcp_MailTools [Bearer token]
         WorkIQ-->>App: 202 Accepted
     end
 
     App->>Foundry: Chat completion (Comment added confirmation)
     Foundry-->>App: Final response text
-    
+
     App->>Teams: Deliver response to analyst
     Teams-->>Analyst: "Incident 4821 summarized. Investigation comment added."
 ```

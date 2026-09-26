@@ -6,7 +6,7 @@
       "name": "SOC Buddy ARM Template",
       "version": "1.0.0"
     },
-    "description": "Deploys all Azure resources for SOC Buddy: Azure AI Foundry (Cognitive Services), Azure Container Registry, Log Analytics, Container Apps Environment, User-Assigned Managed Identity, RBAC Role Assignments, and Azure Container App."
+    "description": "Deploys all Azure resources for SOC Buddy: Azure AI Foundry (Cognitive Services), Azure Container Registry, Log Analytics, Container Apps Environment, User-Assigned Managed Identity, RBAC Role Assignments, Azure Container App, Azure Bot, and Microsoft Teams channel."
   },
   "parameters": {
     "appName": {
@@ -43,7 +43,8 @@
     },
     "teamsBotClientId": {
       "type": "string",
-      "defaultValue": "",
+      "minLength": 36,
+      "maxLength": 36,
       "metadata": {
         "description": "The Application (Client) ID of the Teams Bot App Registration."
       }
@@ -72,12 +73,12 @@
   },
   "variables": {
     "uniqueSuffix": "[uniqueString(resourceGroup().id)]",
-    "cleanAppName": "[take(replace(replace(toLower(parameters('appName')), '-', ''), '_', ''), 16)]",
     "uamiName": "[format('uami-{0}', parameters('appName'))]",
-    "acrName": "[take(format('acr{0}{1}', variables('cleanAppName'), variables('uniqueSuffix')), 48)]",
+    "acrBaseName": "[replace(parameters('appName'), '-', '')]",
+    "acrName": "[take(format('acr{0}{1}', variables('acrBaseName'), variables('uniqueSuffix')), 50)]",
     "logAnalyticsName": "[format('log-{0}', parameters('appName'))]",
     "caeName": "[format('cae-{0}', parameters('appName'))]",
-    "foundryAccountName": "[take(format('foundry-{0}-{1}', variables('cleanAppName'), variables('uniqueSuffix')), 60)]",
+    "foundryAccountName": "[take(format('foundry-{0}-{1}', parameters('appName'), variables('uniqueSuffix')), 64)]",
     "cognitiveServicesUserRoleId": "a97b65f3-24c7-4388-baec-2e87135dc908",
     "acrPullRoleId": "7f951dda-4ed3-4680-a7ca-43fe172d538d"
   },
@@ -262,10 +263,6 @@
                   "value": "[format('https://{0}.{1}/auth/callback', parameters('appName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('caeName')), '2024-03-01').defaultDomain)]"
                 },
                 {
-                  "name": "AUTH_FLOW_TTL_SECONDS",
-                  "value": "600"
-                },
-                {
                   "name": "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHORITY",
                   "value": "[format('https://login.microsoftonline.com/{0}', parameters('tenantId'))]"
                 },
@@ -336,6 +333,43 @@
             "minReplicas": 1,
             "maxReplicas": 1
           }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.BotService/botServices",
+      "apiVersion": "2022-09-15",
+      "name": "[parameters('appName')]",
+      "location": "global",
+      "kind": "azurebot",
+      "sku": {
+        "name": "F0"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', parameters('appName'))]"
+      ],
+      "properties": {
+        "displayName": "[parameters('appName')]",
+        "description": "Microsoft Teams bot for SOC Buddy",
+        "endpoint": "[format('https://{0}/api/messages', reference(resourceId('Microsoft.App/containerApps', parameters('appName')), '2024-03-01').configuration.ingress.fqdn)]",
+        "msaAppId": "[parameters('teamsBotClientId')]",
+        "msaAppType": "SingleTenant",
+        "msaAppTenantId": "[parameters('tenantId')]"
+      }
+    },
+    {
+      "type": "Microsoft.BotService/botServices/channels",
+      "apiVersion": "2022-09-15",
+      "name": "[format('{0}/MsTeamsChannel', parameters('appName'))]",
+      "location": "global",
+      "dependsOn": [
+        "[resourceId('Microsoft.BotService/botServices', parameters('appName'))]"
+      ],
+      "properties": {
+        "channelName": "MsTeamsChannel",
+        "properties": {
+          "acceptedTerms": true,
+          "isEnabled": true
         }
       }
     }

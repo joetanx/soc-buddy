@@ -5,12 +5,13 @@ SOC Buddy is a security operations companion for security teams using Microsoft 
 It helps analysts triage/manage incidents, execute KQL threat hunts, inspect evidences, and draft communications directly within Microsoft Teams.
 
 It is built on LangChain with Agent 365 observability integration, and uses on-behalf-of user access with the following tools:
-- Azure management tools
-  - `list_workspaces` discovers Microsoft Sentinel-enabled Log Analytics workspaces.
-  - `list_tables_in_workspace` lists the tables in a selected workspace.
+- Azure service management
+  - `list_workspaces` uses [resource graph query](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/resources/azure-mgmt-resourcegraph/generated_samples/resources_basic_query.py) to list Sentinel-enabled Log Analytics workspaces.
+  - `list_tables_in_workspace` [lists the tables](https://learn.microsoft.com/en-us/python/api/azure-mgmt-loganalytics/azure.mgmt.loganalytics.operations.tablesoperations#azure-mgmt-loganalytics-operations-tablesoperations-list-by-workspace) in a selected workspace.
 - [Microsoft Graph Security API](https://learn.microsoft.com/en-us/graph/api/resources/security-api-overview)
-  - `get_table_schema` retrieves a Log Analytics table schema.
-  - `run_hunting_query` runs custom KQL, while dedicated threat-intelligence and user, host, and IP blast-radius tools handle common investigation workflows.
+  - [run_hunting_query](https://learn.microsoft.com/en-us/graph/api/security-security-runhuntingquery) runs custom KQL.
+    - Specific search tools use run hunting query to find threat intelligence matches and hunt blast-radius of user, host and IP entities.
+    - `get_table_schema` uses run hunting query to retrieve a Log Analytics table schema.
   - [Create comment](https://learn.microsoft.com/en-us/graph/api/security-incident-post-comments)
   - [Update incident](https://learn.microsoft.com/en-us/graph/api/security-incident-update)
 - [Work IQ Mail](https://learn.microsoft.com/en-us/microsoft-copilot-studio/mcp-mail-tools)
@@ -161,13 +162,12 @@ The a365 CLI requires several human interaction when provisioning agent identity
 > Download the `a365.config.json` and `a365.generated.config.json` files from the cloud shell via `Manage files` and keep them.
 >
 > `a365.generated.config.json` contains the following information that is used by `deploy.sh`:
-> - `agentBlueprintId`: The Client ID of the blueprint app registration.
-> - `agentIdentityId`: The object/instance ID of the agent identity service principal.
-> - `tenantId`: Entra Tenant ID.
+> - `agentBlueprintId`: The client ID of the blueprint app registration.
+> - `agenticAppId`: The object ID of the agent identity.
 
 ### 1.3. Teams Bot Registration
 
-SOC Buddy communicates with human analysts through an Azure Bot with the Microsoft Teams channel enabled. `deploy.sh` creates the single-tenant Entra application registration, its service principal, the Azure Bot resource, and the Teams channel. No Teams Developer Portal setup or pre-generated bot client ID is required.
+SOC Buddy communicates with human analysts through an Azure Bot with the Microsoft Teams channel enabled. `deploy.sh` creates the single-tenant Entra application registration and its service principal, while `azuredeploy.json` provisions the Azure Bot resource and Teams channel. No Teams Developer Portal setup or pre-generated bot client ID is required.
 
 ## 2. Running the Deployment Script
 
@@ -204,8 +204,8 @@ The deployment script automates all required Azure infrastructure setup using an
 flowchart TD
     A(Start deploy.sh) --> B(1. Environment & Prerequisite Checks)
     B --> C(2. Validate Prerequisites & Environment Variables)
-    C --> D(3. Deploy Infrastructure via ARM Template)
-    D --> E(4. Create Azure Bot & Enable Teams Channel)
+    C --> D(3. Set Up Azure Bot Identity)
+    D --> E(4. Deploy Infrastructure via ARM Template)
     E --> F(5. Build Container Image in ACR & Update Container App)
     F --> G("6. Setup Federated Identity Credentials (FIC)")
     G --> H(7. Configure Required API Permissions & Grant Admin Consent)
@@ -213,16 +213,17 @@ flowchart TD
 ```
 
 1. Environment & Prerequisite Checks
-    - Verify `az`, `pwsh`, and `python3` are available
+    - Verify `az` and `python3` are available
     - Ensure resource providers `Microsoft.App`, `Microsoft.OperationalInsights`, `Microsoft.ContainerRegistry`, `Microsoft.CognitiveServices`, and `Microsoft.BotService` are registered
 2. Validate Prerequisites & Environment Variables
     - Check that `a365.generated.config.json` and `azuredeploy.json` files exist
     - Check required environment variables (`APP_NAME`, `LOCATION`), and default `FOUNDRY_MODEL` to `gpt-5.6-luna`
-    - Parse `a365.generated.config.json` for agent blueprint, agent identity and tenant IDs
+    - Parse `a365.generated.config.json` for agent blueprint and agent identity IDs
     - Ensure resource group (`rg-${APP_NAME}`) exists
-    - Create or reuse the single-tenant Teams Bot Entra application and service principal
     - Resolve model version for specified model
-3. Deploy Infrastructure via ARM Template
+3. Set Up Azure Bot Identity
+    - Create the single-tenant Azure Bot Entra application and service principal
+4. Deploy Infrastructure via ARM Template
    - Deploys `azuredeploy.json` using `az deployment group create`.
    - Provisions:
      - User-Assigned Managed Identity (UAMI)
@@ -231,33 +232,31 @@ flowchart TD
      - Azure AI Foundry (`AIServices` S0 + Model Deployment with resolved model version)
      - RBAC Role Assignments: `Cognitive Services User` and `AcrPull` for UAMI
      - Azure Container App (with initial image and all environment variables / connections)
+     - Azure Bot resource configured with the Container App `/api/messages` endpoint
+     - Microsoft Teams channel
    - Outputs: `acrName`, `uamiPrincipalId`, `uamiClientId`, `messagingEndpoint`, `oauthRedirectUri`, `foundryEndpoint`
-4. Create Azure Bot Resource and Enable the Teams Channel
-    - Create or update an Azure Bot resource using the generated Teams Bot application ID
-    - Configure the Container App `/api/messages` endpoint as the bot messaging endpoint
-    - Enable the Microsoft Teams channel
 5. Build Container Image in ACR & Update Container App
     - Submits workspace directory (`Dockerfile`, `pyproject.toml`, `app.py`) to Container Registry for cloud build (`az acr build`)
     - Updates Container App from initial image to built image (`${ACR_NAME}.azurecr.io/${APP_NAME}:latest`).
 6. Setup Federated Identity Credentials (FIC)
-    - Add UAMI as FIC to agent blueprint and Teams bot app
-    - Configure redirect URI and agent blueprint API permission on Teams bot app
+    - Add UAMI as FIC to agent blueprint and Azure bot app
+    - Configure redirect URI and agent blueprint API permission on Azure bot app
 7. Configure Required API Permissions & Grant Admin Consent
     - Add Azure Service Management, Microsoft Graph Security, and Work IQ Mail resources to the agent blueprint's inheritable permissions
     - Assign `user_impersonation`, `SecurityIncident.ReadWrite.All`, `ThreatHunting.Read.All`, and `Tools.ListInvoke.All` delegated permissions to the agent blueprint
     - Grant admin consent for assigned permissions
     - Verify permissions granted
 8. Completion & Next Steps Summary
-    - Displays the generated Teams Bot client ID, `MESSAGING_ENDPOINT`, `OAUTH_REDIRECT_URI`, `ACR_NAME`, and post-deployment checklist.
+    - Displays the generated Azure Bot client ID, `MESSAGING_ENDPOINT`, `OAUTH_REDIRECT_URI`, `ACR_NAME`, and post-deployment checklist.
 
 ## 3. Post-Deployment Configuration
 
 The script prints the generated Teams Bot client ID and automatically configures the Azure Bot messaging endpoint.
 
 ### 3.1. Publish & Activate Agent in Microsoft 365 Admin Center
-1. Download the [example Teams app manifest](https://github.com/joetanx/defender/tree/main/soc-buddy/manifest/manifest.json)
-2. Replace `<teams-bot-id>` with the Teams Bot client ID printed by `deploy.sh`, and replace `<agent-identity>` with the Agent Identity ID
-3. Download the generic [color.png](https://github.com/joetanx/defender/tree/main/soc-buddy/manifest/color.png) and [outline.png](https://github.com/joetanx/defender/tree/main/soc-buddy/manifest/outline.png) icons or use your own icons ([icons must meet certain size requirements](https://learn.microsoft.com/en-us/microsoftteams/platform/concepts/design/design-teams-app-icon-store-appbar))
+1. Download the [example Teams app manifest](https://github.com/joetanx/soc-buddy/tree/main/manifest/manifest.json)
+2. Replace `<azure-bot-id>` with the Azure Bot client ID printed by `deploy.sh`, and replace `<agent-identity>` with the Agent Identity ID
+3. Download the generic [color.png](https://github.com/joetanx/soc-buddy/tree/main/manifest/color.png) and [outline.png](https://github.com/joetanx/soc-buddy/tree/main/manifest/outline.png) icons or use your own icons ([icons must meet certain size requirements](https://learn.microsoft.com/en-us/microsoftteams/platform/concepts/design/design-teams-app-icon-store-appbar))
 4. Zip `manifest.json`, `color.png` and `outline.png` into a zip package
 5. Open [Microsoft 365 Admin Center - Agents](https://admin.cloud.microsoft/#/agents/all)
 6. Click `Add agent` → `Choose file` → select the zipped package → click `Next`
@@ -320,7 +319,7 @@ az cognitiveservices usage list --location $LOCATION --query "[?contains(name.va
 In event of re-setup with same name, delete and purge the Foundry resource manually, then delete the resource group
 
 ```sh
-az cognitiveservices account delete -n $FOUNDRY_NAME$ -g $RG
-az cognitiveservices account purge -n $FOUNDRY_NAME$ -g $RG -l $LOCATION
+az cognitiveservices account delete -n $FOUNDRY_NAME -g $RG
+az cognitiveservices account purge -n $FOUNDRY_NAME -g $RG -l $LOCATION
 az group delete -n $RG
 ```
