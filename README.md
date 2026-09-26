@@ -86,7 +86,8 @@ graph TB
 soc-buddy/
 ├── deploy.sh            # Deployment script to run in Azure Cloud Shell
 ├── DESIGN.md            # Details on identity architecture and tools catalog
-├── SETUP.md             # Setup guide and prerequisites
+├── README.md            # Setup guide and prerequisites
+├── azuredeploy.json      # ARM template used by deploy.sh
 ├── containerapp.yaml    # Azure Container Apps template definition
 ├── Dockerfile           # Container image build to run the SOC Buddy application
 ├── pyproject.toml       # Python dependencies required by the SOC Buddy application
@@ -100,7 +101,7 @@ The setup is designed to be run in Azure Cloud Shell (bash), which has `az`, `do
 
 > [!Important]
 >
-> Azure Cloud Shell is convenient, but the session is ephemeral, so any files to be kept from the session must be download via `Manage files`.
+> Azure Cloud Shell is convenient, but the session is ephemeral, so any files to be kept from the session must be downloaded via `Manage files`.
 
 ## 1. Prerequisites
 
@@ -113,12 +114,12 @@ Deploying SOC Buddy interacts with Azure Subscription resources and Microsoft En
 | Contributor | Azure RBAC / Subscription | Create Azure resources. |
 | User Access Administrator | Azure RBAC / Subscription | Assign `Cognitive Services User` and `AcrPull` roles to the User-Assigned Managed Identity (UAMI). |
 | Cloud Application Administrator / Application Administrator | Entra ID / User | Create service principal; Add Federated Identity Credentials (FIC) to the Agent Blueprint and Teams Bot app registrations. |
-| Privileged Role Administrator | Entra ID / User | Grant tenant-wide Admin Consent for delegated scopes on the Blueprint (Azure Service Management `user_impersonation`, `SecurityIncident.ReadWrite.All`, `ThreatHunting.Read.All`, and Work IQ Mail `Tools.ListInvoke.All`). |
+| Privileged Role Administrator | Entra ID / User | Grant tenant-wide Admin Consent for required permissions. |
 | AI Administrator | Entra ID / User | Publish agent manifest in Microsoft 365 Admin Center. |
 
-### 1.2. Provision Agent Identity  with a365 CLI
+### 1.2. Provision Agent Identity with a365 CLI
 
-The a365 CLI requires several human interaction when provisioning agent identity. Hence, this is done before running `deploy.sh`.
+The a365 CLI requires several interactive steps when provisioning an agent identity. Therefore, run it before `deploy.sh`.
 
 1. Install a365 CLI in the Cloud Shell:
 
@@ -147,23 +148,23 @@ The a365 CLI requires several human interaction when provisioning agent identity
     a365 setup all -n "<your-agent-name>"
     ```
 
-> Optional: delete agent blueprint client secret
->
-> ```sh
-> BLUEPRINT_CLIENT_ID=$(python3 -c "import json; print(json.load(open('a365.generated.config.json'))['agentBlueprintId'])")
-> BLUEPRINT_SECRET_ID=$(az ad app credential list --id $BLUEPRINT_CLIENT_ID --query "[].{KeyId:keyId}" -o tsv)
-> az ad app credential delete --id $BLUEPRINT_CLIENT_ID --key-id $BLUEPRINT_SECRET_ID
-> ```
+    > Optional: delete agent blueprint client secret
+    >
+    > ```sh
+    > BLUEPRINT_CLIENT_ID=$(python3 -c "import json; print(json.load(open('a365.generated.config.json'))['agentBlueprintId'])")
+    > BLUEPRINT_SECRET_ID=$(az ad app credential list --id $BLUEPRINT_CLIENT_ID --query "[].{KeyId:keyId}" -o tsv)
+    > az ad app credential delete --id $BLUEPRINT_CLIENT_ID --key-id $BLUEPRINT_SECRET_ID
+    > ```
 
 5. Capture Generated Files:
 
-> [!Important]
->
-> Download the `a365.config.json` and `a365.generated.config.json` files from the cloud shell via `Manage files` and keep them.
->
-> `a365.generated.config.json` contains the following information that is used by `deploy.sh`:
-> - `agentBlueprintId`: The client ID of the blueprint app registration.
-> - `agenticAppId`: The object ID of the agent identity.
+    > [!Important]
+    >
+    > Download the `a365.config.json` and `a365.generated.config.json` files from the cloud shell via `Manage files` and keep them.
+    >
+    > `a365.generated.config.json` contains the following information that is used by `deploy.sh`:
+    > - `agentBlueprintId`: The client ID of the blueprint app registration.
+    > - `agenticAppId`: The object ID of the agent identity.
 
 ### 1.3. Teams Bot Registration
 
@@ -236,16 +237,16 @@ flowchart TD
      - Microsoft Teams channel
    - Outputs: `acrName`, `uamiPrincipalId`, `uamiClientId`, `messagingEndpoint`, `oauthRedirectUri`, `foundryEndpoint`
 5. Build Container Image in ACR & Update Container App
-    - Submits workspace directory (`Dockerfile`, `pyproject.toml`, `app.py`) to Container Registry for cloud build (`az acr build`)
+    - Submits the repository (`Dockerfile`, `pyproject.toml`, and `app/`) to Container Registry for cloud build (`az acr build`)
     - Updates Container App from initial image to built image (`${ACR_NAME}.azurecr.io/${APP_NAME}:latest`).
 6. Setup Federated Identity Credentials (FIC)
     - Add UAMI as FIC to agent blueprint and Azure bot app
     - Configure redirect URI and agent blueprint API permission on Azure bot app
 7. Configure Required API Permissions & Grant Admin Consent
-    - Add Azure Service Management, Microsoft Graph Security, and Work IQ Mail resources to the agent blueprint's inheritable permissions
-    - Assign `user_impersonation`, `SecurityIncident.ReadWrite.All`, `ThreatHunting.Read.All`, and `Tools.ListInvoke.All` delegated permissions to the agent blueprint
+    - Add Azure Service Management, Microsoft Graph Security, Work IQ Mail, and Agent 365 Observability resources to the agent blueprint's inheritable permissions
+    - Assign `user_impersonation`, `SecurityIncident.ReadWrite.All`, `ThreatHunting.Read.All`, and `Tools.ListInvoke.All` delegated permissions, plus the `Agent365.Observability.OtelWrite` application permission, to the agent blueprint
     - Grant admin consent for assigned permissions
-    - Verify permissions granted
+    - If the signed-in account cannot grant consent, print a tenant-wide admin-consent URL for a tenant administrator
 8. Completion & Next Steps Summary
     - Displays the generated Azure Bot client ID, `MESSAGING_ENDPOINT`, `OAUTH_REDIRECT_URI`, `ACR_NAME`, and post-deployment checklist.
 
@@ -254,9 +255,9 @@ flowchart TD
 The script prints the generated Teams Bot client ID and automatically configures the Azure Bot messaging endpoint.
 
 ### 3.1. Publish & Activate Agent in Microsoft 365 Admin Center
-1. Download the [example Teams app manifest](https://github.com/joetanx/soc-buddy/tree/main/manifest/manifest.json)
+1. Download the [example Teams app manifest](https://github.com/joetanx/soc-buddy/blob/main/manifest/manifest.json)
 2. Replace `<azure-bot-id>` with the Azure Bot client ID printed by `deploy.sh`, and replace `<agent-identity>` with the Agent Identity ID
-3. Download the generic [color.png](https://github.com/joetanx/soc-buddy/tree/main/manifest/color.png) and [outline.png](https://github.com/joetanx/soc-buddy/tree/main/manifest/outline.png) icons or use your own icons ([icons must meet certain size requirements](https://learn.microsoft.com/en-us/microsoftteams/platform/concepts/design/design-teams-app-icon-store-appbar))
+3. Download the generic [color.png](https://github.com/joetanx/soc-buddy/blob/main/manifest/color.png) and [outline.png](https://github.com/joetanx/soc-buddy/blob/main/manifest/outline.png) icons or use your own icons ([icons must meet certain size requirements](https://learn.microsoft.com/en-us/microsoftteams/platform/concepts/design/design-teams-app-icon-store-appbar))
 4. Zip `manifest.json`, `color.png` and `outline.png` into a zip package
 5. Open [Microsoft 365 Admin Center - Agents](https://admin.cloud.microsoft/#/agents/all)
 6. Click `Add agent` → `Choose file` → select the zipped package → click `Next`
@@ -278,7 +279,7 @@ Add this line below `logging.basicConfig` in `app/app.py`:
 logging.getLogger("microsoft.opentelemetry.a365.core.exporters").setLevel(logging.DEBUG)
 ```
 
-This generates debug logs to verify obervability telemetry exporting.
+This generates debug logs to verify observability telemetry exporting.
 
 Example:
 

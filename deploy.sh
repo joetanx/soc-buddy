@@ -4,8 +4,8 @@
 # ====================================================================================
 # Deploys Azure resources using an ARM template, builds the container image in ACR,
 # configures Managed Identity, creates the Azure Bot app registration and resource,
-# sets up FIC for Agent Blueprint & Azure Bot, and grants delegated permissions for
-# Work IQ Mail MCP, Azure, and Microsoft Graph Security Incidents and Threat Hunting.
+# sets up FIC for Agent Blueprint & Azure Bot, and grants required permissions for
+# Work IQ Mail MCP, Azure, Microsoft Graph Security, and Agent 365 Observability.
 # ====================================================================================
 
 set -euo pipefail
@@ -148,13 +148,8 @@ log_info "Foundry Model:      ${BOLD}${FOUNDRY_MODEL}${NC}"
 # Parse a365.generated.config.json
 log_info "Parsing configuration from: $CONFIG_FILE"
 
-BLUEPRINT_CLIENT_ID=$(python3 -c "
-import json
-print(json.load(open('$CONFIG_FILE'))['agentBlueprintId'])" 2>/dev/null || true)
-
-AGENTIC_INSTANCE_ID=$(python3 -c "
-import json
-print(json.load(open('$CONFIG_FILE'))['agenticAppId'])" 2>/dev/null || true)
+BLUEPRINT_CLIENT_ID=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['agentBlueprintId'])" 2>/dev/null || true)
+AGENTIC_INSTANCE_ID=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['agenticAppId'])" 2>/dev/null || true)
 
 if [ -z "$BLUEPRINT_CLIENT_ID" ]; then
     log_error "agentBlueprintId not found in $CONFIG_FILE."
@@ -195,7 +190,7 @@ log_info "Resolved model version: ${BOLD}${FOUNDRY_MODEL_VERSION}${NC}"
 # 3. Setup Azure Bot identity
 # ------------------------------------------------------------------------------
 # Create or reuse single-tenant Entra application for Azure Bot.
-log_step "Creating Azure Bot identity..."
+log_step "Setting up Azure Bot identity..."
 
 CHECK_AZURE_BOT_CLIENT_ID=$(az ad app list --query "[?displayName == '${APP_NAME}'].appId" -o tsv)
 
@@ -207,13 +202,13 @@ else
         --display-name "$APP_NAME" \
         --sign-in-audience "AzureADMyOrg" \
         --query "appId" -o tsv)
-    while ! az ad app show --id "$AZURE_BOT_CLIENT_ID" &>/dev/null; do
+    while [ -z "$(az ad app show --id "$AZURE_BOT_CLIENT_ID" --query "appId" -o tsv 2>/dev/null)" ]; do
         log_info "Waiting for Azure Bot application to be available..."
         sleep 1
     done
 fi
 
-CHECK_AZURE_BOT_SP_ID=$(az ad sp show --id $AZURE_BOT_CLIENT_ID --query "id" -o tsv 2>/dev/null)
+CHECK_AZURE_BOT_SP_ID=$(az ad sp show --id "$AZURE_BOT_CLIENT_ID" --query "id" -o tsv 2>/dev/null || true)
 
 if [ -n "$CHECK_AZURE_BOT_SP_ID" ]; then
     AZURE_BOT_SP_ID="$CHECK_AZURE_BOT_SP_ID"
@@ -388,104 +383,103 @@ log_success "Blueprint access permission ('access_agent_as_user') configured on 
 # ------------------------------------------------------------------------------
 # 7. Configure Inheritable and Required API Permissions & Grant Admin Consent
 # ------------------------------------------------------------------------------
-log_step "Granting MCP Server and Microsoft Graph Delegated Permissions..."
 
 # Permission Definitions:
-# 1. Work IQ Mail MCP:              App 16b1878d-62c7-4009-aa25-68989d63bbad, SPN 93aac09f-5f9b-4b4c-aa45-c623a1b69342, DelegatedRoleId fa91a9e8-6808-4167-a950-8f1fe525b270, Scope Tools.ListInvoke.All
-# 2. Azure Tools:                   App 797f4846-ba00-4fd7-ba43-dac1f8f63013, SPN 71e36942-1dcc-468d-bb7f-6ca533a87559, DelegatedRoleId 41094075-9dad-400e-a0bd-54e686782033, Scope user_impersonation
-# 3. Microsoft Graph:               App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId 128ca929-1a19-45e6-a3b8-435ec44a36ba, Scope SecurityIncident.ReadWrite.All
-#                                   App 00000003-0000-0000-c000-000000000000, SPN aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId b152eca8-ea73-4a48-8c98-1a6742673d99, Scope ThreatHunting.Read.All
+# 1. Work IQ Mail MCP:       App 16b1878d-62c7-4009-aa25-68989d63bbad, Obj 93aac09f-5f9b-4b4c-aa45-c623a1b69342, DelegatedRoleId fa91a9e8-6808-4167-a950-8f1fe525b270, Scope Tools.ListInvoke.All
+# 2. Azure Tools:            App 797f4846-ba00-4fd7-ba43-dac1f8f63013, Obj 71e36942-1dcc-468d-bb7f-6ca533a87559, DelegatedRoleId 41094075-9dad-400e-a0bd-54e686782033, Scope user_impersonation
+# 3. Microsoft Graph:        App 00000003-0000-0000-c000-000000000000, Obj aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId 128ca929-1a19-45e6-a3b8-435ec44a36ba, Scope SecurityIncident.ReadWrite.All
+#                            App 00000003-0000-0000-c000-000000000000, Obj aaad2076-26ab-4905-b1eb-090f627b17d7, DelegatedRoleId b152eca8-ea73-4a48-8c98-1a6742673d99, Scope ThreatHunting.Read.All
+# 4. Agent365 Observability: App 9b975845-388f-4429-889e-eab1ef63949c, Obj a3af7c4d-8203-45c5-a467-ea084e2bbcfa, AppRoleId 8f71190c-00c8-461d-a63b-f74abde9ba52, Role Agent365.Observability.OtelWrite
 
 # Deprecated Sentinel MCP Permissions:
-# 1. Sentinel MCP Data Exploration: App 4500ebfb-89b6-4b14-a480-7f749797bfcd, SPN eaff9684-612c-4add-aa10-035fd3bfe3d1, DelegatedRoleId 991a963a-4203-4dbc-acf2-254a258f76f2, Scope SentinelPlatform.DelegatedAccess
-# 2. Sentinel MCP Triage:           App 7b7b3966-1961-47b5-b080-43ca5482e21c, SPN 8dd500d0-c3aa-4380-96d1-09b4b6233eff, DelegatedRoleId 69b8d760-4df6-4017-a3e6-1a8049cbce42, Scope MCP.Read.All
+# 1. Data Exploration: App 4500ebfb-89b6-4b14-a480-7f749797bfcd, Obj eaff9684-612c-4add-aa10-035fd3bfe3d1, DelegatedRoleId 991a963a-4203-4dbc-acf2-254a258f76f2, Scope SentinelPlatform.DelegatedAccess
+# 2. Triage:           App 7b7b3966-1961-47b5-b080-43ca5482e21c, Obj 8dd500d0-c3aa-4380-96d1-09b4b6233eff, DelegatedRoleId 69b8d760-4df6-4017-a3e6-1a8049cbce42, Scope MCP.Read.All
 
-# Step 7A: Allow agent identities created from the Blueprint to inherit delegated permissions
+log_step "Configuring permissions and granting admin consent..."
 BLUEPRINT_OBJECT_ID=$(az ad app show --id "$BLUEPRINT_CLIENT_ID" --query id -o tsv)
+
+# Step 7A: Allow agent identities created from the Blueprint to inherit permissions
 INHERITABLE_PERMISSIONS_ENDPOINT="https://graph.microsoft.com/v1.0/applications/${BLUEPRINT_OBJECT_ID}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions"
+log_info "Setting inheritable permissions on blueprint..."
 
-ensure_inheritable_permission() {
-    local resource_app_id=$1
-    local existing_resource_app_id
-
+for resource_app_id in "16b1878d-62c7-4009-aa25-68989d63bbad" "797f4846-ba00-4fd7-ba43-dac1f8f63013" "00000003-0000-0000-c000-000000000000" "9b975845-388f-4429-889e-eab1ef63949c"; do
     existing_resource_app_id=$(az rest \
         --method get \
         --url "$INHERITABLE_PERMISSIONS_ENDPOINT" \
         --query "value[?resourceAppId=='${resource_app_id}'].resourceAppId | [0]" \
         --output tsv)
-
     if [ "$existing_resource_app_id" = "$resource_app_id" ]; then
         log_info "Resource $resource_app_id is already inheritable from the Blueprint."
-        return
+    else
+        log_info "Adding resource $resource_app_id as an inheritable Blueprint permission..."
+        az rest --method post \
+            --url "$INHERITABLE_PERMISSIONS_ENDPOINT" \
+            --headers "Content-Type=application/json" \
+            --body "{\"resourceAppId\":\"${resource_app_id}\",\"inheritableScopes\":{\"@odata.type\":\"microsoft.graph.allAllowedScopes\"}}" \
+            --output none
     fi
-
-    log_info "Adding resource $resource_app_id as an inheritable Blueprint permission..."
-    az rest --method post \
-        --url "$INHERITABLE_PERMISSIONS_ENDPOINT" \
-        --headers "Content-Type=application/json" \
-        --body "{\"resourceAppId\":\"${resource_app_id}\",\"inheritableScopes\":{\"@odata.type\":\"microsoft.graph.allAllowedScopes\"}}" \
-        --output none
-}
-
-# Work IQ and Microsoft Graph inheritable permissions should already be handled separately by a365 CLI.
-ensure_inheritable_permission "16b1878d-62c7-4009-aa25-68989d63bbad"
-ensure_inheritable_permission "797f4846-ba00-4fd7-ba43-dac1f8f63013"
-ensure_inheritable_permission "00000003-0000-0000-c000-000000000000"
+done
 
 log_success "Inheritable permissions configured on Blueprint."
 
-# Step 8B: Declare delegated permissions on the Blueprint App Registration
-ensure_delegated_permission() {
-    local resource_app_id=$1
-    local scope_id=$2
-    local scope_name=$3
-    local existing_scope_id
+# Step 7B: Add required application and delegated permissions without replacing
+# permissions that a365 or an administrator already configured.
+BLUEPRINT_APP_ENDPOINT="https://graph.microsoft.com/v1.0/applications/${BLUEPRINT_CLIENT_ID}"
+TARGET_ACCESS='[
+    {
+        "resourceAppId": "16b1878d-62c7-4009-aa25-68989d63bbad",
+        "resourceAccess": [{"id": "fa91a9e8-6808-4167-a950-8f1fe525b270", "type": "Scope"}]
+    },
+    {
+        "resourceAppId": "797f4846-ba00-4fd7-ba43-dac1f8f63013",
+        "resourceAccess": [{"id": "41094075-9dad-400e-a0bd-54e686782033", "type": "Scope"}]
+    },
+    {
+        "resourceAppId": "00000003-0000-0000-c000-000000000000",
+        "resourceAccess": [
+            {"id": "128ca929-1a19-45e6-a3b8-435ec44a36ba", "type": "Scope"},
+            {"id": "b152eca8-ea73-4a48-8c98-1a6742673d99", "type": "Scope"}
+        ]
+    },
+    {
+        "resourceAppId": "9b975845-388f-4429-889e-eab1ef63949c",
+        "resourceAccess": [{"id": "8f71190c-00c8-461d-a63b-f74abde9ba52", "type": "Role"}]
+    }
+]'
 
-    existing_scope_id=$(az ad app permission list \
-        --id "$BLUEPRINT_CLIENT_ID" \
-        --query "[?resourceAppId=='${resource_app_id}'].resourceAccess[] | [?id=='${scope_id}'].id | [0]" \
-        --output tsv)
+log_info "Adding required permissions using requiredResourceAccess..."
+az rest --method patch \
+    --url "$BLUEPRINT_APP_ENDPOINT" \
+    --headers "Content-Type=application/json" \
+    --body "{\"requiredResourceAccess\": $TARGET_ACCESS}"
+log_success "Required resource access configured on Blueprint."
 
-    if [ "$existing_scope_id" = "$scope_id" ]; then
-        log_info "Delegated permission '$scope_name' is already declared on the Blueprint."
-        return
-    fi
-
-    log_info "Declaring delegated permission '$scope_name' on the Blueprint..."
-    az ad app permission add \
-        --id "$BLUEPRINT_CLIENT_ID" \
-        --api "$resource_app_id" \
-        --api-permissions "${scope_id}=Scope" \
-        --output none
-}
-
-ensure_delegated_permission \
-    "16b1878d-62c7-4009-aa25-68989d63bbad" \
-    "fa91a9e8-6808-4167-a950-8f1fe525b270" \
-    "Tools.ListInvoke.All"
-ensure_delegated_permission \
-    "797f4846-ba00-4fd7-ba43-dac1f8f63013" \
-    "41094075-9dad-400e-a0bd-54e686782033" \
-    "user_impersonation"
-ensure_delegated_permission \
-    "00000003-0000-0000-c000-000000000000" \
-    "128ca929-1a19-45e6-a3b8-435ec44a36ba" \
-    "SecurityIncident.ReadWrite.All"
-ensure_delegated_permission \
-    "00000003-0000-0000-c000-000000000000" \
-    "b152eca8-ea73-4a48-8c98-1a6742673d99" \
-    "ThreatHunting.Read.All"
-
-log_success "Blueprint delegated permissions declared."
-
-# Step 8C: Attempt tenant-wide admin consent
-log_info "Attempting admin consent on Blueprint Application..."
+# Step 7C: Attempt tenant-wide admin consent
+ADMIN_CONSENT_SCOPES="16b1878d-62c7-4009-aa25-68989d63bbad/Tools.ListInvoke.All https://management.azure.com/user_impersonation https://graph.microsoft.com/SecurityIncident.ReadWrite.All https://graph.microsoft.com/ThreatHunting.Read.All api://9b975845-388f-4429-889e-eab1ef63949c/Agent365.Observability.OtelWrite"
+ADMIN_CONSENT_REDIRECT_URI="https://entra.microsoft.com/TokenAuthorize"
+log_info "Attempting admin consent on Blueprint..."
 ADMIN_CONSENT_REQUIRED=false
 if ADMIN_CONSENT_OUTPUT=$(az ad app permission admin-consent --id "$BLUEPRINT_CLIENT_ID" 2>&1); then
     log_success "Tenant-wide admin consent granted."
 elif grep -Eqi "insufficient|privilege|authorization|authorized|forbidden|global administrator" <<< "$ADMIN_CONSENT_OUTPUT"; then
     ADMIN_CONSENT_REQUIRED=true
-    ADMIN_CONSENT_URL="https://login.microsoftonline.com/${TENANT_ID}/adminconsent?client_id=${BLUEPRINT_CLIENT_ID}"
+    ADMIN_CONSENT_STATE=$(python3 -c "import secrets; print(secrets.token_hex(16))")
+    ADMIN_CONSENT_URL=$(python3 -c '
+import sys
+from urllib.parse import quote, urlencode
+
+tenant_id, client_id, scopes, redirect_uri, state = sys.argv[1:]
+query = urlencode(
+    {
+        "client_id": client_id,
+        "scope": scopes,
+        "redirect_uri": redirect_uri,
+        "state": state,
+    },
+    quote_via=quote,
+)
+print(f"https://login.microsoftonline.com/{tenant_id}/v2.0/adminconsent?{query}")
+' "$TENANT_ID" "$BLUEPRINT_CLIENT_ID" "$ADMIN_CONSENT_SCOPES" "$ADMIN_CONSENT_REDIRECT_URI" "$ADMIN_CONSENT_STATE")
     log_warn "The signed-in account cannot grant tenant-wide admin consent."
     log_warn "Ask a tenant administrator to grant consent out of band using this URL:"
     echo -e "${YELLOW}${BOLD}${ADMIN_CONSENT_URL}${NC}"
@@ -520,9 +514,9 @@ echo -e "3. Messaging endpoint set to: ${CYAN}${MESSAGING_ENDPOINT}${NC}"
 echo -e "4. OAuth redirect URI set to: ${CYAN}${OAUTH_REDIRECT_URI}${NC}"
 echo -e "5. Blueprint access permission added to Bot App (${AZURE_BOT_CLIENT_ID})."
 if [ "$ADMIN_CONSENT_REQUIRED" = true ]; then
-    echo -e "6. Blueprint delegated API permissions declared; admin consent is pending."
+    echo -e "6. Blueprint API permissions declared; admin consent is pending."
 else
-    echo -e "6. Blueprint delegated API permissions declared and admin consent granted."
+    echo -e "6. Blueprint API permissions declared and admin consent granted."
 fi
 echo -e "========================================================================"
 echo -e "${YELLOW}${BOLD}POST-DEPLOYMENT ACTION REQUIRED:${NC}"

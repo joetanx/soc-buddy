@@ -15,7 +15,7 @@
   },
   "description": {
     "short": "Security operations assistant built on LangChain.",
-    "full": "Security operations assistant built on LangChain with Azure workspace discovery, Microsoft Graph incident and threat-hunting tools, and Work IQ mail tools."
+    "full": "Security operations assistant built on LangChain with Azure workspace discovery, Graph security incident and threat-hunting, and Work IQ mail tools."
   },
   "icons": {
     "outline": "outline.png",
