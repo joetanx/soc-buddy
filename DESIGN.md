@@ -235,7 +235,7 @@ sequenceDiagram
         WorkIQ-->>App: 202 Accepted
     end
 
-    App->>Foundry: Chat completion (Comment added confirmation)
+    App->>Foundry: Chat completion (Mail sent / comment added confirmation)
     Foundry-->>App: Final response text
 
     App->>Teams: Deliver response to analyst
