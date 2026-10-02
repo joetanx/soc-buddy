@@ -1,5 +1,5 @@
 [project]
-name = "a365-jupyter-sample"
+name = "soc-buddy"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -20,11 +20,6 @@ dependencies = [
 
     # Core dependencies
     "aiohttp",
-
-    # Microsoft Agent 365 SDK packages
-    "microsoft_agents_a365_tooling",
-    "microsoft_agents_a365_runtime",
-    "microsoft_agents_a365_notifications",
 
     # Observability using Microsoft Opentelemetry
     "microsoft-opentelemetry",

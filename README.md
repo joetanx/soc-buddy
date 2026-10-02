@@ -87,8 +87,8 @@ soc-buddy/
 ├── deploy.sh            # Deployment script to run in Azure Cloud Shell
 ├── DESIGN.md            # Details on identity architecture and tools catalog
 ├── README.md            # Setup guide and prerequisites
-├── azuredeploy.json      # ARM template used by deploy.sh
-├── containerapp.yaml    # Azure Container Apps template definition
+├── azuredeploy.json     # ARM template used by deploy.sh
+├── containerapp.yaml    # Azure Container Apps template definition (for reference/manual deployment)
 ├── Dockerfile           # Container image build to run the SOC Buddy application
 ├── pyproject.toml       # Python dependencies required by the SOC Buddy application
 └── app/
@@ -204,13 +204,12 @@ The deployment script automates all required Azure infrastructure setup using an
 ```mermaid
 flowchart TD
     A(Start deploy.sh) --> B(1. Environment & Prerequisite Checks)
-    B --> C(2. Validate Prerequisites & Environment Variables)
-    C --> D(3. Set Up Azure Bot Identity)
-    D --> E(4. Deploy Infrastructure via ARM Template)
-    E --> F(5. Build Container Image in ACR & Update Container App)
-    F --> G("6. Setup Federated Identity Credentials (FIC)")
-    G --> H(7. Configure Required API Permissions & Grant Admin Consent)
-    H --> I(8. Completion & Next Steps Summary)
+    B --> C(2. Set Up Azure Bot Identity)
+    C --> D(3. Deploy Infrastructure via ARM Template)
+    D --> E(4. Build Container Image in ACR & Update Container App)
+    E --> F("5. Setup Federated Identity Credentials (FIC)")
+    F --> G(6. Configure Required API Permissions & Grant Admin Consent)
+    G --> H(7. Completion & Next Steps Summary)
 ```
 
 1. Environment & Prerequisite Checks
@@ -284,7 +283,6 @@ This generates debug logs to verify observability telemetry exporting.
 Example:
 
 ```log
-DEBUG:microsoft.opentelemetry.a365.core.exporters.agent365_exporter:HTTP 200 success. Correlation ID: d12d5ea2-92dc-443f-99b4-24ba185f825e. Response: {"results":[{"spanId":"319f552e96c0fc28","sinks":{"flashpoint":{"status":"sent"},"sentinel":{"status":"sent"},"esp":{"status":"sent"}}},{"spanId":"d172e92cc1f237e8","sinks":{"flashpoint":{"status":"se...
 DEBUG:microsoft.opentelemetry.a365.core.exporters.utils:[Agent365Exporter] 14 spans without an eligible gen_ai.operation.name filtered out
 DEBUG:microsoft.opentelemetry.a365.core.exporters.agent365_exporter:Found 1 identity groups with 4 total spans to export
 DEBUG:microsoft.opentelemetry.a365.core.exporters.agent365_exporter:Exporting 4 spans to endpoint: https://agent365.svc.cloud.microsoft/observabilityService/tenants/323626f5-1bfe-48cd-8902-ddfdfd44e1ce/otlp/agents/8b577472-1c66-4586-bb81-a2f626dd0b09/traces?api-version=1 (tenant: 323626f5-1bfe-48cd-8902-ddfdfd44e1ce, agent: 8b577472-1c66-4586-bb81-a2f626dd0b09)
@@ -312,7 +310,7 @@ az acr build -r $ACR_NAME -t $APP_NAME:latest -f Dockerfile .
 ### 4.3. Query region for model capacity limit and current usage
 
 ```sh
-az cognitiveservices usage list --location $LOCATION --query "[?contains(name.value, '$MODEL_NAME')]"
+az cognitiveservices usage list --location $LOCATION --query "[?contains(name.value, '$FOUNDRY_MODEL')]"
 ```
 
 ### 4.4. Delete and purge Foundry resource

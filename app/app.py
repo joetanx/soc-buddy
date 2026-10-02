@@ -233,36 +233,6 @@ def authentication_card(auth_url: str) -> Activity:
     )
 
 
-# Instantiate the in-memory checkpointer for persisting conversation history.
-checkpointer = InMemorySaver()
-
-@before_model
-def trim_conversation_history(state: AgentState, runtime) -> dict:
-    # Simple history trimming strategy to keep the conversation within token limits.
-    return {
-        "messages": trim_messages(
-            state["messages"],
-            strategy="last",
-            token_counter="approximate",
-            max_tokens=128_000,
-            start_on="human",
-            include_system=True,
-        )
-    }
-
-def get_thread_id(context: TurnContext) -> str:
-    # Return a stable checkpoint namespace for the current conversation.
-    activity = context.activity
-    conversation = getattr(activity, "conversation", None)
-    conversation_id = getattr(conversation, "id", None) or getattr(activity, "conversation_id", None)
-    if conversation_id:
-        return str(conversation_id)
-
-    sender = getattr(activity, "from_property", None)
-    sender_id = getattr(sender, "id", None)
-    return str(sender_id or getattr(activity, "id", "default"))
-
-
 # Token wrapper for synchronous Azure management SDK clients.
 class AzureAccessTokenProvider:
     def __init__(self, token: str):
@@ -504,7 +474,7 @@ async def get_graph_tools(user_id: str) -> list[BaseTool]:
         incident_id: Annotated[str, Field(description="Incident ID")],
         comment: Annotated[str, Field(description="Comment to be added")]
     ) -> str:
-        """Add a comment to a Microsoft security incident."""
+        """Add a comment to the incident. Supports HTML content. Maximum length is 1000 characters, including HTML tags."""
         request_body = AlertComment(odata_type=None, comment=comment)
         url = f"https://graph.microsoft.com/v1.0/security/incidents/{incident_id}/comments"
         await graph_client.security.incidents.with_url(url).post(request_body)
@@ -518,9 +488,9 @@ async def get_graph_tools(user_id: str) -> list[BaseTool]:
         classification: Annotated[Optional[str], Field(description="Classification of the incident; options: falsePositive, truePositive, informationalExpectedActivity")] = None,
         determination: Annotated[Optional[str], Field(description="Details to incident classification; options: unknown, apt, malware, securityPersonnel, securityTesting, unwantedSoftware, other, multiStagedAttack, compromisedAccount, phishing, maliciousUserActivity, notMalicious, notEnoughDataToValidate, confirmedUserActivity, lineOfBusinessApplication")] = None,
         custom_tags: Annotated[Optional[list[str]], Field(description="Custom tags for the incident")] = None,
-        resolving_comment: Annotated[Optional[str], Field(description="Comment to explain the resolution of the incident and the classification choice")] = None,
+        resolving_comment: Annotated[Optional[str], Field(description="Comment to explain incident resolution and classification choice")] = None,
     ) -> str:
-        """Update fields on a Microsoft security incident, omitted fields remain unchanged."""
+        """Update the incident. Omitted fields remain unchanged."""
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = _parse_enum(IncidentStatus, status)
@@ -551,6 +521,7 @@ async def get_graph_tools(user_id: str) -> list[BaseTool]:
         add_incident_comment,
         update_incident,
     ]
+
 
 # MCP server tools
 
@@ -583,6 +554,36 @@ async def get_mcp_tools(user_id: str) -> list[BaseTool]:
         }
     client = MultiServerMCPClient(servers)
     return await client.get_tools()
+
+
+# Instantiate the in-memory checkpointer for persisting conversation history.
+checkpointer = InMemorySaver()
+
+@before_model
+def trim_conversation_history(state: AgentState, runtime) -> dict:
+    # Simple history trimming strategy to keep the conversation within token limits.
+    return {
+        "messages": trim_messages(
+            state["messages"],
+            strategy="last",
+            token_counter="approximate",
+            max_tokens=128_000,
+            start_on="human",
+            include_system=True,
+        )
+    }
+
+def get_thread_id(context: TurnContext) -> str:
+    # Return a stable checkpoint namespace for the current conversation.
+    activity = context.activity
+    conversation = getattr(activity, "conversation", None)
+    conversation_id = getattr(conversation, "id", None) or getattr(activity, "conversation_id", None)
+    if conversation_id:
+        return str(conversation_id)
+
+    sender = getattr(activity, "from_property", None)
+    sender_id = getattr(sender, "id", None)
+    return str(sender_id or getattr(activity, "id", "default"))
 
 # Agent setup.
 @tool
